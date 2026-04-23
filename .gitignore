@@ -1,0 +1,13 @@
+# Rust build artifacts
+target/
+
+# Local env and generated audit logs
+.env
+.env.*
+audit.jsonl
+*.log
+
+# VS Code and OS
+.vscode/
+.DS_Store
+Thumbs.db
