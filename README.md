@@ -8,6 +8,8 @@
 
 Vyrox Proxy is the containment execution boundary for Vyrox, implemented as a small Rust service that receives signed action requests and calls endpoint security APIs only after boundary checks pass. It exists as a separate repository because the open-core model depends on it: this proxy is MIT licensed so CISOs in zero-trust mode can audit exactly what code is allowed to isolate a host, kill a process, or block a hash before deploying anything else.
 
+Website: vyrox.dev (coming soon)
+
 ## Why This Exists
 
 The proxy is where side effects happen. The rest of the system can classify alerts incorrectly and produce embarrassment; this component can interrupt production workloads if implemented poorly. That is why it is isolated from the triage stack and kept intentionally narrow in scope.
@@ -83,6 +85,8 @@ Contributions are most useful in tests, input validation hardening, error-path b
 Do not submit changes that weaken HMAC verification, bypass the rate limiter, or add unsafe Rust without a written security justification. New action types require threat review and audit-log coverage before discussion moves past draft.
 
 See CONTRIBUTING.md for the full process. The project is in alpha and external contributions are accepted selectively for security-critical paths.
+
+Security contact: sec.vyrox@proton.me
 
 ## Licence
 
