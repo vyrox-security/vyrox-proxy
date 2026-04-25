@@ -1,0 +1,77 @@
+name: Bug Report
+description: Something is broken. Tell us exactly how broken and what you expected instead.
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: check that this is not a known limitation in SECURITY.md.
+        If this is a security vulnerability, do not file here. Email security@vyrox.security.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Be specific. "It does not work" is not actionable.
+      placeholder: |
+        Sent signed request to POST /execute.
+        Expected 200, received 401.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include exact commands and payload details where possible.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: v0.1.0-alpha
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - HMAC verification
+        - Rate limiter
+        - Action dispatcher
+        - Audit log
+        - API surface
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Redact secrets and tenant identifiers before pasting.
+      render: shell
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for duplicates.
+          required: true
+        - label: I redacted all secrets and tenant data.
+          required: true
+        - label: This is not a security vulnerability. If it is, I will email security@vyrox.security.
+          required: true

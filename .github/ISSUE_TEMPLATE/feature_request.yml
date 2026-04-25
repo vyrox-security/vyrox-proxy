@@ -1,0 +1,56 @@
+name: Feature Request
+description: You want Vyrox Proxy to do something it does not currently do. Describe the problem first.
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The best requests explain the problem and constraints clearly.
+        If the request is "add unsafe for performance," the answer is no.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that you cannot do now?
+    validations:
+      required: true
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Current workaround
+      description: How are you handling this today?
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution (optional)
+      description: If it touches HMAC, rate limiting, or action dispatch, explain tradeoffs.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - HMAC verification
+        - Rate limiter
+        - Action dispatcher
+        - Audit log
+        - API surface
+        - Tooling
+        - Documentation
+        - New component
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: How blocked are you without this?
+      options:
+        - Completely blocked
+        - Significant inconvenience
+        - Quality-of-life improvement
+    validations:
+      required: true

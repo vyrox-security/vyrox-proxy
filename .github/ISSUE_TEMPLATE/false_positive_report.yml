@@ -1,0 +1,60 @@
+name: False Positive or False Negative Report
+description: Vyrox triaged an alert incorrectly. This is high-priority feedback.
+labels: ["false-positive", "triage-quality"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        False positive: benign activity flagged as malicious.
+        False negative: real threat underclassified.
+        Redact hostnames, usernames, and process paths before submitting.
+
+  - type: dropdown
+    id: classification-type
+    attributes:
+      label: Type of misclassification
+      options:
+        - False positive (benign flagged malicious)
+        - False negative (real threat missed or underclassified)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Which stage produced the incorrect verdict?
+      options:
+        - Heuristics engine (Stage 1)
+        - LLM triage (Stage 2)
+        - Unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: alert-description
+    attributes:
+      label: Describe the alert (redacted)
+      description: Summarize context in plain text. Do not paste raw production JSON.
+    validations:
+      required: true
+
+  - type: textarea
+    id: received
+    attributes:
+      label: Verdict received from Vyrox
+      placeholder: "CRITICAL, confidence 0.91, pattern: mimikatz_lsass"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Correct verdict
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Operational context
+      description: What was actually happening on the host?
