@@ -1,6 +1,8 @@
 # vyrox-proxy — Rust Containment Proxy
 
 > Public, MIT-licensed. CISOs will audit this code. Every line must be explainable.
+>
+> **Important:** For co-founder commit planning, see [vyrox/commit-plan.md](../vyrox/commit-plan.md)
 
 ## What This Is
 
