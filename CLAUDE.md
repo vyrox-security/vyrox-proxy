@@ -42,6 +42,16 @@ Global rate limits are a denial-of-service vector. Each tenant gets their own bu
 
 ---
 
+## Git Workflow
+
+- **NEVER push directly to main** — always use a feature branch
+- Branch naming: `feat/<description>`, `fix/<description>`, `docs/<description>`
+- Commit style: [Conventional Commits](https://www.conventionalcommits.org/)
+- PR required before merge — squash-merge preferred
+- Run validation before PR: `cargo clippy -- -D warnings && cargo test`
+
+---
+
 ## Build & Test
 
 ```bash
