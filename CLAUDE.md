@@ -9,6 +9,27 @@
 An Axum-based Rust HTTP server that executes containment actions against EDR APIs
 (CrowdStrike RTR, SentinelOne) on human-approved requests from the Vyrox Python backend.
 
+## Open Source Roadmap
+
+This is the **open-core** component — the execution layer that runs containment actions
+on customer infrastructure. Community contributions welcome!
+
+| Feature | Status | Priority |
+|---------|--------|----------|
+| CrowdStrike RTR | ✅ Done | P0 |
+| SentinelOne containment | ✅ Done | P0 |
+| Microsoft Defender integration | 🔄 In Progress | P1 |
+| Network quarantine (S1) | 📋 Planned | P1 |
+| User suspension (AD integration) | 📋 Planned | P2 |
+| Audit log encryption | 📋 Planned | P2 |
+
+### How to Contribute
+
+1. Fork the repo
+2. Create a branch: `feat/<feature>` or `fix/<issue>`
+3. Run `cargo clippy -- -D warnings && cargo test`
+4. Submit PR with description
+
 ```
 src/
 ├── main.rs       # App entry, route registration, /execute handler
