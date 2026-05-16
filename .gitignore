@@ -7,6 +7,12 @@ target/
 audit.jsonl
 *.log
 
+# Cargo generated
+Cargo.lock
+
+# Dev config
+.claude/
+
 # VS Code and OS
 .vscode/
 .DS_Store
