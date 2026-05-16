@@ -1,3 +1,5 @@
+![Vyrox Proxy Banner](assets/vyrox-proxy-banner.png)
+
 # Vyrox Proxy
 
 ![Licence](https://img.shields.io/badge/licence-MIT-2ea44f?style=flat-square)
