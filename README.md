@@ -6,7 +6,7 @@
 ![Platform](https://img.shields.io/badge/platform-rust-b7410e?style=flat-square)
 ![Compile Time](https://img.shields.io/badge/cargo%20build-coffee%20required-6a737d?style=flat-square)
 
-**Vyrox is now an AI Security Copilot that runs your SOC 24/7 — for $2K/month.**
+**Vyrox is now an AI Security Copilot that runs your SOC 24/7 **
 
 The proxy is the containment execution boundary for Vyrox, implemented as a small Rust service that receives signed action requests and calls endpoint security APIs only after boundary checks pass. It exists as a separate repository because the open-core model depends on it: this proxy is MIT licensed so CISOs in zero-trust mode can audit exactly what code is allowed to isolate a host, kill a process, or block a hash before deploying anything else.
 
