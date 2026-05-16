@@ -8,7 +8,7 @@
 #   just <command>   # Run specific command
 # =====================================================================
 
-set shell := ["zsh", "-cu"]
+set shell := ["sh", "-cu"]
 
 # =====================================================================
 # DEFAULT
@@ -45,25 +45,21 @@ run:
 run-release:
     cargo run --release
 
-# Run with custom port
-run-port port="3000":
-    RUST_PORT={{ port }} cargo run
-
 # =====================================================================
 # TESTING
 # =====================================================================
 
-# Run all tests
+# Run all tests (single-threaded for deterministic IO tests)
 test:
-    cargo test --all
+    cargo test --all -- --test-threads=1
 
 # Run tests with output
 test-verbose:
-    cargo test --all -- --nocapture
+    cargo test --all -- --nocapture --test-threads=1
 
 # Run specific test
 test-name name:
-    cargo test {{ name }}
+    cargo test {{ name }} -- --test-threads=1
 
 # Run doc tests
 test-docs:
@@ -112,9 +108,9 @@ outdated:
 # RELEASE
 # =====================================================================
 
-# Bump version and tag
+# Bump version and tag (requires cargo-release plugin)
 release type="patch":
-    cargo {{ type }} --git-tag
+    @echo "Manual version bump required. Use: cargo release {{ type }}"
     @echo "Tag created. Push with: git push --follow-tags"
 
 # Publish to crates.io
@@ -123,7 +119,7 @@ publish:
 
 # Build binary for release
 release-binary:
-    cargo build --release --release-type=stripped
+    RUSTFLAGS="-C strip=symbols" cargo build --release
     @echo "Binary: target/release/vyrox-proxy"
 
 # =====================================================================
@@ -152,7 +148,7 @@ docs-open:
 
 # Check docs build
 docs-check:
-    cargo doc --no-deps --verify
+    cargo doc --no-deps
 
 # =====================================================================
 # DEVELOPMENT
@@ -180,11 +176,7 @@ size:
 
 # Full CI pipeline
 ci:
-    set -e
-    cargo fmt --all -- --check
-    cargo clippy --all-targets -- -D warnings
-    cargo test --all
-    cargo audit
+    cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test --all -- --test-threads=1 && cargo audit
 
 # Build for multiple targets
 cross-compile:

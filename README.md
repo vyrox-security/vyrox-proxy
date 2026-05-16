@@ -82,6 +82,16 @@ cargo fmt -- --check
 | DRY_RUN | No | true | If true, logs actions and skips live EDR calls |
 | AUDIT_LOG_PATH | No | ./audit.jsonl | Append-only JSONL audit log output path |
 
+## Request Authentication
+
+All requests to `/execute` must include a valid HMAC-SHA256 signature in the `X-Vyrox-Signature` header:
+
+```
+X-Vyrox-Signature: sha256=<hex-encoded-hmac-signature>
+```
+
+The signature must be computed using the shared `VYROX_HMAC_SECRET` over the raw request body. The `sha256=` prefix is required.
+
 ## Contributing
 
 Contributions are most useful in tests, input validation hardening, error-path behavior, and documentation improvements that remove ambiguity in the execution contract. Bug reports with reproducible requests and signatures are especially valuable.
