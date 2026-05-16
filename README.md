@@ -2,7 +2,7 @@
 
 ![Licence](https://img.shields.io/badge/licence-MIT-2ea44f?style=flat-square)
 ![Build](https://img.shields.io/badge/build-passing-2ea44f?style=flat-square)
-![Version](https://img.shields.io/badge/version-v0.1.0--alpha-005cc5?style=flat-square)
+![Version](https://img.shields.io/badge/version-v0.1.0-005cc5?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-rust-b7410e?style=flat-square)
 ![Compile Time](https://img.shields.io/badge/cargo%20build-coffee%20required-6a737d?style=flat-square)
 

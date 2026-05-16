@@ -4,10 +4,10 @@
 
 | Version | Supported |
 | --- | --- |
-| v0.1.x | Yes |
-| < v0.1.0-alpha | No |
+| v0.1.0 | Yes |
+| < v0.1.0 | No |
 
-Versions before `v0.1.0-alpha` are not supported and should not be deployed.
+Versions before `v0.1.0` are not supported and should not be deployed.
 
 ## Reporting a Vulnerability
 
