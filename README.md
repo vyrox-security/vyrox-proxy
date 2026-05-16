@@ -6,13 +6,17 @@
 ![Platform](https://img.shields.io/badge/platform-rust-b7410e?style=flat-square)
 ![Compile Time](https://img.shields.io/badge/cargo%20build-coffee%20required-6a737d?style=flat-square)
 
-Vyrox Proxy is the containment execution boundary for Vyrox, implemented as a small Rust service that receives signed action requests and calls endpoint security APIs only after boundary checks pass. It exists as a separate repository because the open-core model depends on it: this proxy is MIT licensed so CISOs in zero-trust mode can audit exactly what code is allowed to isolate a host, kill a process, or block a hash before deploying anything else.
+**Vyrox is now an AI Security Copilot that runs your SOC 24/7 — for $2K/month.**
 
-Website: vyrox.dev (coming soon)
+The proxy is the containment execution boundary for Vyrox, implemented as a small Rust service that receives signed action requests and calls endpoint security APIs only after boundary checks pass. It exists as a separate repository because the open-core model depends on it: this proxy is MIT licensed so CISOs in zero-trust mode can audit exactly what code is allowed to isolate a host, kill a process, or block a hash before deploying anything else.
+
+Website: [vyrox.dev](https://vyrox.dev)
 
 ## Why This Exists
 
 The proxy is where side effects happen. The rest of the system can classify alerts incorrectly and produce embarrassment; this component can interrupt production workloads if implemented poorly. That is why it is isolated from the triage stack and kept intentionally narrow in scope.
+
+As part of Vyrox's AI Security Copilot model, this proxy executes the automated response actions that make 24/7 SOC operations possible — without requiring human intervention for routine threats.
 
 Rust is used here for memory safety and predictable runtime behavior in a service that should fail closed, not fail interestingly. Request authentication is HMAC-SHA256 so callers can be verified without introducing expensive key exchange machinery in the alpha phase.
 
@@ -51,7 +55,7 @@ Prerequisites:
 1. Start the local stack using the compose file in `vyrox-deploy`.
 
 ```bash
-# Start ingestion, worker, slack bot, and proxy from the shared compose file
+# Start ingestion, worker, Discord bot, and proxy from the shared compose file
 docker compose -f ../vyrox-deploy/docker-compose.yml up -d
 ```
 
