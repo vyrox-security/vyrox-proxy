@@ -22,6 +22,7 @@ struct AppState {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct ExecuteRequest {
+    tenant_id: String,
     alert_id: String,
     action_type: actions::ActionType,
     host: String,
@@ -84,6 +85,7 @@ async fn execute(
         payload.approved_by,
         state.dry_run,
     );
+    // TODO: Pass tenant_id to append_audit for Rule 1 namespacing
     audit::append_audit(&state.audit_log_path, entry)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
