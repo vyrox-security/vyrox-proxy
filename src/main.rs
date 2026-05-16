@@ -22,6 +22,7 @@ struct AppState {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct ExecuteRequest {
+    tenant_id: String,
     alert_id: String,
     action_type: actions::ActionType,
     host: String,
@@ -38,7 +39,7 @@ struct ExecuteResponse {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let hmac_secret = env::var("VYROX_HMAC_SECRET").unwrap_or_else(|_| "dev-secret".to_string());
+    let hmac_secret = env::var("VYROX_HMAC_SECRET").expect("VYROX_HMAC_SECRET must be set");
     let audit_log_path = env::var("AUDIT_LOG_PATH").unwrap_or_else(|_| "./audit.jsonl".to_string());
     let dry_run = env::var("DRY_RUN").unwrap_or_else(|_| "true".to_string()) == "true";
 
@@ -53,7 +54,9 @@ async fn main() {
         .route("/execute", post(execute))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.expect("bind should work");
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+        .await
+        .expect("bind should work");
     info!("vyrox proxy listening on :3000");
     axum::serve(listener, app).await.expect("server should run");
 }
@@ -82,6 +85,7 @@ async fn execute(
         payload.approved_by,
         state.dry_run,
     );
+    // TODO: Pass tenant_id to append_audit for Rule 1 namespacing
     audit::append_audit(&state.audit_log_path, entry)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

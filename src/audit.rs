@@ -13,7 +13,11 @@ pub struct AuditEntry {
 }
 
 pub async fn append_audit(path: &str, entry: AuditEntry) -> Result<(), std::io::Error> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path).await?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
     let line = serde_json::to_string(&entry).expect("audit entry serialization should not fail");
     file.write_all(line.as_bytes()).await?;
     file.write_all(b"\n").await?;
@@ -21,7 +25,12 @@ pub async fn append_audit(path: &str, entry: AuditEntry) -> Result<(), std::io::
     Ok(())
 }
 
-pub fn build_entry(action_type: String, host: String, approved_by: String, dry_run: bool) -> AuditEntry {
+pub fn build_entry(
+    action_type: String,
+    host: String,
+    approved_by: String,
+    dry_run: bool,
+) -> AuditEntry {
     AuditEntry {
         timestamp: Utc::now().timestamp(),
         action_type,
