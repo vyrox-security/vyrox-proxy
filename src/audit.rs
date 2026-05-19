@@ -1,11 +1,12 @@
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AuditEntry {
     pub timestamp: i64,
+    pub tenant_id: String,
     pub action_type: String,
     pub host: String,
     pub approved_by: String,
@@ -26,6 +27,7 @@ pub async fn append_audit(path: &str, entry: AuditEntry) -> Result<(), std::io::
 }
 
 pub fn build_entry(
+    tenant_id: String,
     action_type: String,
     host: String,
     approved_by: String,
@@ -33,9 +35,21 @@ pub fn build_entry(
 ) -> AuditEntry {
     AuditEntry {
         timestamp: Utc::now().timestamp(),
+        tenant_id,
         action_type,
         host,
         approved_by,
         dry_run,
     }
+}
+
+pub async fn read_audit_logs(path: &str) -> Result<Vec<AuditEntry>, std::io::Error> {
+    let content = tokio::fs::read_to_string(path).await?;
+    let mut entries = Vec::new();
+    for line in content.lines() {
+        if let Ok(entry) = serde_json::from_str::<AuditEntry>(line) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
 }
