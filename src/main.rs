@@ -1,7 +1,7 @@
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Json;
 use axum::routing::{get, post};
@@ -69,9 +69,31 @@ async fn main() {
         dry_run,
     };
 
+    #[derive(Debug, Deserialize)]
+    struct ExportQuery {
+        tenant_id: String,
+    }
+
+    async fn export_audit(
+        State(state): State<AppState>,
+        Query(query): Query<ExportQuery>,
+    ) -> Result<Json<Vec<audit::AuditEntry>>, StatusCode> {
+        let entries = audit::read_audit_logs(&state.audit_log_path)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let filtered: Vec<audit::AuditEntry> = entries
+            .into_iter()
+            .filter(|e| e.tenant_id == query.tenant_id)
+            .collect();
+
+        Ok(Json(filtered))
+    }
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/execute", post(execute))
+        .route("/audit/export", get(export_audit))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
@@ -103,12 +125,12 @@ async fn execute(
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
     let entry = audit::build_entry(
+        payload.tenant_id.clone(),
         format!("{:?}", payload.action_type),
         payload.host,
         payload.approved_by,
         state.dry_run,
     );
-    // TODO: Pass tenant_id to append_audit for Rule 1 namespacing
     audit::append_audit(&state.audit_log_path, entry)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
