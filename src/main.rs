@@ -1,4 +1,5 @@
 use std::env;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -12,6 +13,8 @@ use tracing::info;
 mod actions;
 mod audit;
 mod hmac;
+
+const REPLAY_WINDOW_SECONDS: i64 = 30;
 
 #[derive(Clone)]
 struct AppState {
@@ -27,12 +30,29 @@ struct ExecuteRequest {
     action_type: actions::ActionType,
     host: String,
     approved_by: String,
+    #[serde(rename = "approved_at")]
+    approved_at: i64,
 }
 
 #[derive(Debug, Serialize)]
 struct ExecuteResponse {
     status: String,
     dry_run: bool,
+}
+
+fn check_replay_window(approved_at: i64) -> Result<(), StatusCode> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .as_secs() as i64;
+
+    let diff = now - approved_at;
+
+    if diff.abs() > REPLAY_WINDOW_SECONDS {
+        return Err(StatusCode::GONE);
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -70,6 +90,9 @@ async fn execute(
     headers: HeaderMap,
     Json(payload): Json<ExecuteRequest>,
 ) -> Result<Json<ExecuteResponse>, StatusCode> {
+    // Check replay window (Rule 3: HMAC Before Processing)
+    check_replay_window(payload.approved_at)?;
+
     let signature = headers
         .get("X-Vyrox-Signature")
         .and_then(|value| value.to_str().ok())
