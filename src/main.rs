@@ -1,24 +1,44 @@
-//! Vyrox Proxy - Rust Containment Action Executor
+//! Vyrox Proxy — Containment Action Executor
 //!
-//! This service executes approved containment actions (host isolation,
-//! process kill, network quarantine) on behalf of the Vyrox SOC platform.
+//! Single-purpose HTTP service that executes EDR containment actions
+//! (host isolation, process kill, network quarantine) on behalf of the
+//! Vyrox SOC platform. Every action requires a human-approved request
+//! signed with the shared HMAC secret; the proxy verifies the signature
+//! and serves as the only code path that calls the EDR API.
 //!
-//! ## Security Model
+//! ## Request lifecycle
 //!
-//! - All execution requests must include valid HMAC-SHA256 signature
-//! - Timestamps are validated against 30-second replay window
-//! - Actions are logged to append-only audit log with tenant isolation
-//! - DRY_RUN mode prevents actual execution in development
+//! For every `POST /execute` call:
 //!
-//! ## API Endpoints
+//! 1. **Capture raw body** before any parsing. The HMAC must be verified
+//!    against the bytes the client signed, not against a re-serialized
+//!    version of the parsed JSON (which would re-order keys and change
+//!    the digest).
+//! 2. **Verify HMAC** in constant time (see `hmac::verify_signature`).
+//! 3. **Parse the JSON body** into an `ExecuteRequest`.
+//! 4. **Replay window check** — reject if `approved_at` is outside the
+//!    30-second window in either direction.
+//! 5. **Nonce dedup** — claim the `request_id` in the nonce store. If
+//!    already completed, return the cached response. If still in flight,
+//!    return 409 Conflict.
+//! 6. **Audit before action** — write an audit entry recording the
+//!    intent BEFORE invoking the EDR (`audit::append_audit`). This way
+//!    a crash mid-action still leaves a forensic trail.
+//! 7. **Execute via the EDR client** (or return early if DRY_RUN).
+//! 8. **Cache the response** in the nonce store so retries are idempotent.
 //!
-//! - `GET /health` - Service health check
-//! - `POST /execute` - Execute containment action
-//! - `GET /audit/export?tenant_id=<id>` - Export audit logs for tenant
+//! ## Endpoints
+//!
+//! | Method | Path             | Purpose                              |
+//! |--------|------------------|--------------------------------------|
+//! | GET    | /health          | Liveness probe                       |
+//! | POST   | /execute         | Execute a containment action         |
+//! | GET    | /audit/export    | Tenant-scoped audit log export       |
 
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Json;
@@ -26,203 +46,279 @@ use axum::routing::{get, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
-// Internal modules for security-critical functionality
-mod actions; // Action type definitions and execution logic
-mod audit; // Audit log writing with append-only guarantee
-mod hmac; // HMAC-SHA256 signature verification
+mod actions;
+mod audit;
+mod edr;
+mod hmac;
+mod nonce;
 
-/// Replay protection window in seconds.
-/// Requests with timestamps older than this will be rejected.
+/// Replay protection window. Requests with `approved_at` more than this
+/// many seconds away from the current time (in either direction) are
+/// rejected. The bound is symmetric so we also reject far-future
+/// timestamps caused by client clock skew or deliberate manipulation.
 const REPLAY_WINDOW_SECONDS: i64 = 30;
 
-/// Application state shared across all request handlers.
-/// This struct is cloned for each request, so it should contain
-/// only static configuration data.
+/// Application state. Cloned into every request handler, so anything
+/// inside must be cheap to clone (Arc-wrapped data, primitives, etc.).
 #[derive(Clone)]
 struct AppState {
-    /// Shared secret for HMAC signature verification.
-    /// In production, this should come from a secure secrets manager.
+    /// Shared HMAC-SHA256 secret. Provided via env var; never logged.
     hmac_secret: String,
 
-    /// File path for the append-only audit log.
-    /// Format: one JSON entry per line (JSONL)
+    /// Path to the append-only JSONL audit log.
     audit_log_path: String,
 
-    /// Development mode flag - when true, actions are logged but not executed.
-    /// This prevents accidental containment actions in development.
+    /// If true, action execution is skipped and the EDR is never called.
+    /// Default for development and CI. Production must set DRY_RUN=false
+    /// **explicitly** (see `main` — we err on the side of safe-by-default).
     dry_run: bool,
+
+    /// In-process dedup store keyed by `request_id`. See `nonce.rs`.
+    nonces: nonce::NonceStore,
+
+    /// EDR client implementation. Currently dispatches to the configured
+    /// EDR (CrowdStrike Falcon for v0.1-alpha pilot). See `edr.rs`.
+    edr: edr::EdrClient,
 }
 
-/// Request payload for containment action execution.
-/// This struct is received from the Discord bot after human approval.
+/// Request payload for `POST /execute`.
+///
+/// **Stability:** This struct is part of the wire contract with the
+/// Vyrox Discord bot. Changes here must be coordinated with the Python
+/// side (`vyrox/discord_bot/proxy_client.py`).
 #[derive(Debug, Deserialize, Serialize)]
 struct ExecuteRequest {
-    /// Tenant identifier for multi-tenancy isolation.
-    /// All audit entries are tagged with this value.
+    /// Idempotency key. UUID-v4 generated by the Discord bot at the
+    /// moment of approval. The proxy uses it to dedupe retries — see
+    /// `nonce::NonceStore`. MUST be non-empty.
+    request_id: String,
+
+    /// Tenant identifier for multi-tenancy isolation. Tagged on every
+    /// audit entry; used to scope `/audit/export`.
     tenant_id: String,
 
     /// Reference to the original alert that triggered this action.
+    /// Carried through to the audit entry for incident correlation.
     alert_id: String,
 
     /// Type of containment action to execute.
     action_type: actions::ActionType,
 
-    /// Target hostname or IP address for the action.
+    /// Target hostname, device ID, or IP for the action. Format depends
+    /// on the EDR — CrowdStrike Falcon uses device IDs (AIDs); a future
+    /// SentinelOne integration uses agent UUIDs.
     host: String,
 
-    /// Discord username who approved this action.
+    /// Discord username (or display name) who approved the action.
+    /// Recorded in the audit log for accountability.
     approved_by: String,
 
-    /// Unix timestamp when approval was granted.
-    /// Used for replay attack detection.
+    /// Unix timestamp (seconds, UTC) of approval. Used for replay
+    /// protection in `check_replay_window`. The bot sets this via
+    /// `int(time.time())` at button-press time.
     #[serde(rename = "approved_at")]
     approved_at: i64,
 }
 
-/// Response payload returned after action execution.
-#[derive(Debug, Serialize)]
+/// Response payload for `POST /execute`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct ExecuteResponse {
-    /// Human-readable status message.
+    /// Human-readable status. One of:
+    ///   - "executed" — EDR returned success.
+    ///   - "dry_run" — DRY_RUN was set; EDR was not called.
+    ///   - "replayed" — request was previously executed; cached result returned.
     status: String,
 
-    /// Whether the action was actually executed or just logged (dry run).
+    /// Whether DRY_RUN was active when this response was generated.
     dry_run: bool,
 }
 
 /// Query parameters for the audit export endpoint.
 #[derive(Debug, Deserialize)]
 struct ExportQuery {
-    /// Tenant ID to filter audit entries.
-    /// Only entries matching this tenant will be returned.
+    /// Tenant ID filter. Only audit entries with a matching tenant_id
+    /// are returned, ensuring tenant data isolation.
     tenant_id: String,
 }
 
-/// Validates that the approval timestamp is within the replay window.
+/// Reject if `approved_at` is outside the symmetric replay window.
 ///
-/// This function prevents replay attacks where an attacker captures a
-/// valid request and resubmits it later. By checking the timestamp
-/// against the current time, we ensure requests are fresh.
-///
-/// Arguments:
-///   - approved_at: Unix timestamp of the original approval
-///
-/// Returns:
-///   - Ok(()) if timestamp is within the window
-///   - Err(StatusCode::GONE) if timestamp is too old
+/// The window is symmetric (past *and* future) so that a client whose
+/// clock is wildly ahead of ours cannot pre-sign requests for later use.
 fn check_replay_window(approved_at: i64) -> Result<(), StatusCode> {
-    // Get current Unix timestamp
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| StatusCode::BAD_REQUEST)?
         .as_secs() as i64;
 
-    // Calculate absolute time difference
-    let diff = now - approved_at;
-
-    // Reject if the timestamp difference exceeds our window
-    // This handles both old requests (replay) and far-future requests (clock skew)
-    if diff.abs() > REPLAY_WINDOW_SECONDS {
+    if (now - approved_at).abs() > REPLAY_WINDOW_SECONDS {
         return Err(StatusCode::GONE);
     }
-
     Ok(())
 }
 
-/// Health check endpoint for Kubernetes liveness/readiness probes.
+/// `GET /health`
 ///
-/// Returns a simple JSON object indicating the service is running.
+/// Liveness probe for orchestrators (Kubernetes, Fly.io, etc.). The body
+/// is intentionally trivial — readiness vs liveness distinctions are not
+/// useful for a single-binary stateless service of this size.
 async fn health() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
 }
 
-/// Execute a containment action after validating the request.
+/// `POST /execute` — the security-critical entry point.
 ///
-/// This is the primary endpoint that the Discord bot calls after a human
-/// analyst approves a containment action. The request goes through:
-///
-/// 1. Timestamp validation (replay protection)
-/// 2. HMAC signature verification
-/// 3. Audit log entry creation
-/// 4. Action execution (if not dry-run)
-///
-/// Arguments:
-///   - state: Application configuration (HMAC secret, dry-run flag)
-///   - headers: HTTP headers including signature
-///   - payload: Action request details
-///
-/// Returns:
-///   - ExecuteResponse with status and dry-run flag
+/// See module-level docs for the full request lifecycle. The handler is
+/// deliberately verbose and step-numbered to mirror the ordering the
+/// security review depends on; do not reorder steps without re-reading
+/// the threat model.
 async fn execute(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(payload): Json<ExecuteRequest>,
+    body: Bytes,
 ) -> Result<Json<ExecuteResponse>, StatusCode> {
-    // Step 1: Validate timestamp for replay protection
-    // This must happen before any other processing
-    check_replay_window(payload.approved_at)?;
-
-    // Step 2: Extract and verify HMAC signature
-    // The signature must be present in the X-Vyrox-Signature header
+    // ─ Step 1: Verify HMAC on the RAW bytes we received. ──────────────
+    //
+    // Critical correctness point: we verify against `body` (the exact
+    // bytes from the wire), NOT against a re-serialized version of a
+    // parsed struct. The latter would re-order JSON keys and break
+    // signatures, and historically did — that bug masked the real
+    // verification because differing serialization made every signature
+    // mismatch indistinguishable from an invalid signature.
     let signature = headers
         .get("X-Vyrox-Signature")
-        .and_then(|value| value.to_str().ok())
+        .and_then(|v| v.to_str().ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    // Serialize payload to bytes for HMAC verification
-    let body = serde_json::to_vec(&payload).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if let Err(err) = hmac::verify_signature(state.hmac_secret.as_bytes(), &body, signature) {
+        warn!(error = %err, "signature verification failed");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
 
-    // Verify HMAC-SHA256 signature using constant-time comparison
-    hmac::verify_signature(state.hmac_secret.as_bytes(), &body, signature)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    // ─ Step 2: Parse JSON. ────────────────────────────────────────────
+    //
+    // Only after the HMAC passes do we trust the body enough to parse
+    // it. Parsing before verification would expose any serde panic /
+    // pathological input to unauthenticated callers.
+    let payload: ExecuteRequest = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // Step 3: Create audit log entry BEFORE executing
-    // This is a critical security requirement - we log before acting
+    if payload.request_id.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // ─ Step 3: Replay window. ─────────────────────────────────────────
+    check_replay_window(payload.approved_at)?;
+
+    // ─ Step 4: Nonce dedup. ───────────────────────────────────────────
+    //
+    // Claim the request_id. If we've already finished this request,
+    // return the cached response — the client gets a byte-identical
+    // result and the EDR is NOT called again.
+    match state.nonces.claim_or_replay(&payload.request_id) {
+        nonce::Outcome::FreshClaim => { /* fall through to execution */ }
+        nonce::Outcome::AlreadyExecuted {
+            cached_response_json,
+        } => {
+            info!(request_id = %payload.request_id, "replaying cached response");
+            let cached: ExecuteResponse = serde_json::from_str(&cached_response_json)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            return Ok(Json(ExecuteResponse {
+                status: "replayed".to_string(),
+                dry_run: cached.dry_run,
+            }));
+        }
+        nonce::Outcome::InFlight => {
+            warn!(request_id = %payload.request_id, "duplicate while in-flight");
+            return Err(StatusCode::CONFLICT);
+        }
+    }
+
+    // ─ Step 5: Audit BEFORE acting. ───────────────────────────────────
+    //
+    // Even if the EDR call panics, crashes the process, or hangs, we
+    // have a durable record of the intent on disk. The audit log is the
+    // ground truth, not the EDR's response.
     let entry = audit::build_entry(
         payload.tenant_id.clone(),
         format!("{:?}", payload.action_type),
-        payload.host,
-        payload.approved_by,
+        payload.host.clone(),
+        payload.approved_by.clone(),
         state.dry_run,
     );
-    audit::append_audit(&state.audit_log_path, entry)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Err(err) = audit::append_audit(&state.audit_log_path, entry).await {
+        // Audit log failure is fatal — we don't proceed without a
+        // forensic trail. Release the nonce so the bot can retry once
+        // the underlying issue (disk full, perm error) is fixed.
+        warn!(error = %err, "audit write failed; releasing nonce claim");
+        state.nonces.release_claim(&payload.request_id);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
-    // Step 4: Execute the action (or simulate in dry-run mode)
-    // In production, this would call the actual EDR API
-    // For now, we just return the status
+    // ─ Step 6: Execute (or skip in DRY_RUN). ──────────────────────────
+    let response = if state.dry_run {
+        info!(
+            request_id = %payload.request_id,
+            tenant_id = %payload.tenant_id,
+            action = ?payload.action_type,
+            host = %payload.host,
+            "DRY_RUN: skipping EDR call"
+        );
+        ExecuteResponse {
+            status: "dry_run".to_string(),
+            dry_run: true,
+        }
+    } else {
+        // Real execution. The EDR client is responsible for its own
+        // retries, timeouts, and error mapping. We treat any error as
+        // a 502 Bad Gateway and release the nonce so a retry can try
+        // again on fresh state.
+        match state.edr.dispatch(payload.action_type, &payload.host).await {
+            Ok(()) => ExecuteResponse {
+                status: "executed".to_string(),
+                dry_run: false,
+            },
+            Err(err) => {
+                warn!(
+                    request_id = %payload.request_id,
+                    error = %err,
+                    "EDR dispatch failed; releasing nonce claim"
+                );
+                state.nonces.release_claim(&payload.request_id);
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+        }
+    };
 
-    Ok(Json(ExecuteResponse {
-        status: "executed".to_string(),
-        dry_run: state.dry_run,
-    }))
+    // ─ Step 7: Cache the response for future retries. ────────────────
+    //
+    // Serialize once so subsequent replays return byte-identical output.
+    let cache_payload = serde_json::to_string(&response).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state
+        .nonces
+        .record_response(&payload.request_id, cache_payload);
+
+    Ok(Json(response))
 }
 
-/// Export audit logs filtered by tenant ID.
+/// `GET /audit/export?tenant_id=<id>`
 ///
-/// This endpoint allows tenants to retrieve their audit logs for
-/// compliance and investigation purposes. The logs are filtered
-/// server-side to ensure tenant isolation.
+/// Returns all audit entries for the requested tenant. Filtering happens
+/// server-side so a misbehaving caller cannot read another tenant's
+/// entries by post-processing.
 ///
-/// Arguments:
-///   - state: Application configuration (audit log path)
-///   - query: Query parameters including tenant_id
-///
-/// Returns:
-///   - Vector of AuditEntry objects for the requested tenant
+/// Note for production: this reads the entire log into memory on every
+/// call. Fine for pilot scale (10s of MB max); for SaaS we'll move to a
+/// streaming JSONL response and per-tenant log shards.
 async fn export_audit(
     State(state): State<AppState>,
     Query(query): Query<ExportQuery>,
 ) -> Result<Json<Vec<audit::AuditEntry>>, StatusCode> {
-    // Read all audit entries from the log file
     let entries = audit::read_audit_logs(&state.audit_log_path)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Filter entries to only include those from the requested tenant
-    // This ensures multi-tenant data isolation
     let filtered: Vec<audit::AuditEntry> = entries
         .into_iter()
         .filter(|e| e.tenant_id == query.tenant_id)
@@ -231,39 +327,101 @@ async fn export_audit(
     Ok(Json(filtered))
 }
 
-/// Application entry point.
+/// Parse a boolean-ish environment variable.
 ///
-/// Initializes configuration from environment variables and starts
-/// the Axum HTTP server on port 3000.
+/// We accept the common spellings ("true"/"false"/"1"/"0"/"yes"/"no")
+/// because operators write env files by hand and a strict parser leads
+/// to silently-wrong DRY_RUN settings (which is exactly the failure mode
+/// we cannot tolerate).
+fn parse_bool_env(name: &str, default: bool) -> bool {
+    match env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            other => {
+                warn!(
+                    var = name,
+                    value = other,
+                    default,
+                    "unrecognized boolean env var; using default"
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
+/// Application entry point.
 #[tokio::main]
 async fn main() {
-    // Initialize structured logging with timestamps
     tracing_subscriber::fmt::init();
 
-    // Load configuration from environment variables
-    // These are required for security-critical functionality
+    // Required: secret used for HMAC verification. We refuse to start
+    // without it — running with a default would silently disable auth.
     let hmac_secret = env::var("VYROX_HMAC_SECRET").expect("VYROX_HMAC_SECRET must be set");
-    let audit_log_path = env::var("AUDIT_LOG_PATH").unwrap_or_else(|_| "./audit.jsonl".to_string());
-    let dry_run = env::var("DRY_RUN").unwrap_or_else(|_| "true".to_string()) == "true";
+    if hmac_secret.len() < 32 {
+        warn!("VYROX_HMAC_SECRET is shorter than 32 bytes; consider rotating to a longer key");
+    }
 
-    // Build application state
+    let audit_log_path =
+        env::var("AUDIT_LOG_PATH").unwrap_or_else(|_| "./audit.jsonl".to_string());
+
+    // Safe-by-default: DRY_RUN is TRUE unless explicitly turned off.
+    // Operators who want real execution must opt in.
+    let dry_run = parse_bool_env("DRY_RUN", true);
+
+    // Initialize the EDR client. See `edr.rs` for the configuration
+    // contract — secrets are read from env there, not here.
+    let edr = edr::EdrClient::from_env();
+
     let state = AppState {
         hmac_secret,
         audit_log_path,
         dry_run,
+        nonces: nonce::NonceStore::new(),
+        edr,
     };
 
-    // Build HTTP router with all endpoints
     let app = Router::new()
         .route("/health", get(health))
         .route("/execute", post(execute))
         .route("/audit/export", get(export_audit))
         .with_state(state);
 
-    // Bind to port 3000 and start accepting connections
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
-        .await
-        .expect("bind should work");
-    info!("vyrox proxy listening on :3000");
-    axum::serve(listener, app).await.expect("server should run");
+    // Bind address is configurable so the container/host can override
+    // it. Default :3000 keeps backward compatibility with existing
+    // deployment configs.
+    let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+
+    // TLS is enabled when both BOTH cert and key paths are set. This is
+    // an all-or-nothing toggle — partial config (one set, one missing)
+    // is an operator error and we fail loudly so it's not mistaken for
+    // a working TLS deploy.
+    let tls_cert = env::var("TLS_CERT_PATH").ok();
+    let tls_key = env::var("TLS_KEY_PATH").ok();
+
+    match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => {
+            info!(addr = %bind_addr, tls = true, dry_run, "vyrox proxy starting (TLS)");
+            let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+                .await
+                .expect("failed to load TLS cert/key — check TLS_CERT_PATH and TLS_KEY_PATH");
+            axum_server::bind_rustls(bind_addr.parse().expect("invalid BIND_ADDR"), config)
+                .serve(app.into_make_service())
+                .await
+                .expect("server should run");
+        }
+        (None, None) => {
+            // Plain HTTP. Intended for deployment behind a TLS-terminating
+            // reverse proxy (Cloudflare Tunnel, Caddy, nginx). NOT for
+            // direct internet exposure.
+            info!(addr = %bind_addr, tls = false, dry_run, "vyrox proxy starting (plain HTTP)");
+            let listener = tokio::net::TcpListener::bind(&bind_addr)
+                .await
+                .expect("bind should work");
+            axum::serve(listener, app).await.expect("server should run");
+        }
+        _ => panic!("TLS_CERT_PATH and TLS_KEY_PATH must both be set, or both unset"),
+    }
 }

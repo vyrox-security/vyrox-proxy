@@ -5,9 +5,22 @@ edition = "2021"
 
 [dependencies]
 axum = { version = "0.7", features = ["macros", "json"] }
+# `axum-server` adds TLS support on top of axum. The `tls-rustls` feature
+# pulls in a pure-Rust TLS stack with no OpenSSL dependency — important for
+# the static-binary deployment model and for avoiding glibc/openssl ABI hell.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# `dashmap` provides a sharded concurrent HashMap. Used by the nonce store
+# in `src/nonce.rs` for lock-free reads and per-shard write locks. We pick
+# DashMap over `tokio::sync::RwLock<HashMap>` because the dedup path is
+# read-heavy and DashMap scales better under contention.
+dashmap = "5"
 hmac = "0.12"
 hex = "0.4"
+# `reqwest` is the HTTP client used by the EDR module to call CrowdStrike
+# Falcon. We use the rustls-tls feature to match `axum-server`'s TLS stack
+# and avoid pulling in OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
