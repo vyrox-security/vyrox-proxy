@@ -34,3 +34,9 @@ thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[dev-dependencies]
+# `tempfile` powers test fixtures that need a real on-disk audit log.
+# Confined to dev-dependencies so it does not bloat the production
+# binary.
+tempfile = "3"
