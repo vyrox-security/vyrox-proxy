@@ -305,7 +305,11 @@ mod tests {
                 matches!(s.claim_or_replay("hot-key"), Outcome::FreshClaim)
             }));
         }
-        let fresh_wins: usize = handles.into_iter().filter_map(|h| h.join().ok()).filter(|b| *b).count();
+        let fresh_wins: usize = handles
+            .into_iter()
+            .filter_map(|h| h.join().ok())
+            .filter(|b| *b)
+            .count();
         assert_eq!(fresh_wins, 1, "exactly one claim must win FreshClaim");
     }
 }

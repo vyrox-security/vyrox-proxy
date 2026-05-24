@@ -118,8 +118,9 @@ impl EdrClient {
                 EdrClient::Noop
             }
             "crowdstrike" => {
-                let client = CrowdstrikeClient::from_env()
-                    .expect("CROWDSTRIKE_CLIENT_ID/SECRET must be set when EDR_PROVIDER=crowdstrike");
+                let client = CrowdstrikeClient::from_env().expect(
+                    "CROWDSTRIKE_CLIENT_ID/SECRET must be set when EDR_PROVIDER=crowdstrike",
+                );
                 info!("EDR provider: crowdstrike");
                 EdrClient::Crowdstrike(Arc::new(client))
             }
@@ -359,8 +360,17 @@ mod tests {
     #[tokio::test]
     async fn noop_client_succeeds_for_all_actions() {
         let client = EdrClient::Noop;
-        assert!(client.dispatch(ActionType::HostIsolation, "h-1").await.is_ok());
-        assert!(client.dispatch(ActionType::ProcessKill, "h-1").await.is_ok());
-        assert!(client.dispatch(ActionType::NetworkQuarantine, "h-1").await.is_ok());
+        assert!(client
+            .dispatch(ActionType::HostIsolation, "h-1")
+            .await
+            .is_ok());
+        assert!(client
+            .dispatch(ActionType::ProcessKill, "h-1")
+            .await
+            .is_ok());
+        assert!(client
+            .dispatch(ActionType::NetworkQuarantine, "h-1")
+            .await
+            .is_ok());
     }
 }

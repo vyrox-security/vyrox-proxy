@@ -81,6 +81,11 @@ struct AppState {
     /// EDR client implementation. Currently dispatches to the configured
     /// EDR (CrowdStrike Falcon for v0.1-alpha pilot). See `edr.rs`.
     edr: edr::EdrClient,
+
+    /// SHA-256 hash chain state for the audit log. Seeded at boot from
+    /// the last entry on disk so restarts do not break the chain.
+    /// See `audit::ChainState`.
+    audit_chain: audit::ChainState,
 }
 
 /// Request payload for `POST /execute`.
@@ -202,7 +207,8 @@ async fn execute(
     // Only after the HMAC passes do we trust the body enough to parse
     // it. Parsing before verification would expose any serde panic /
     // pathological input to unauthenticated callers.
-    let payload: ExecuteRequest = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let payload: ExecuteRequest =
+        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     if payload.request_id.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
@@ -247,7 +253,7 @@ async fn execute(
         payload.approved_by.clone(),
         state.dry_run,
     );
-    if let Err(err) = audit::append_audit(&state.audit_log_path, entry).await {
+    if let Err(err) = audit::append_audit(&state.audit_log_path, &state.audit_chain, entry).await {
         // Audit log failure is fatal — we don't proceed without a
         // forensic trail. Release the nonce so the bot can retry once
         // the underlying issue (disk full, perm error) is fixed.
@@ -294,7 +300,8 @@ async fn execute(
     // ─ Step 7: Cache the response for future retries. ────────────────
     //
     // Serialize once so subsequent replays return byte-identical output.
-    let cache_payload = serde_json::to_string(&response).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let cache_payload =
+        serde_json::to_string(&response).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     state
         .nonces
         .record_response(&payload.request_id, cache_payload);
@@ -308,13 +315,76 @@ async fn execute(
 /// server-side so a misbehaving caller cannot read another tenant's
 /// entries by post-processing.
 ///
-/// Note for production: this reads the entire log into memory on every
-/// call. Fine for pilot scale (10s of MB max); for SaaS we'll move to a
-/// streaming JSONL response and per-tenant log shards.
+/// ## Authentication
+///
+/// The export endpoint is HMAC-protected. Callers must send:
+///
+///   `X-Vyrox-Signature: sha256=<hex>` — HMAC-SHA256 of the canonical
+///                                       message `"<tenant_id>:<ts>"`.
+///   `X-Vyrox-Timestamp: <unix_seconds>` — UTC unix timestamp used in
+///                                         the canonical message.
+///
+/// The signature is computed over `format!("{tenant_id}:{timestamp}")`
+/// using the same `VYROX_HMAC_SECRET` that protects `/execute`. The
+/// timestamp is rejected if it falls outside the replay window. This
+/// gives `/audit/export` parity with `/execute` for auth + replay
+/// protection without needing a request body.
+///
+/// Without this check, anyone who reaches the proxy can dump any
+/// tenant's containment history just by passing a tenant_id query
+/// parameter. That was the SEV-2 leak we shipped in the original
+/// pilot build; this commit closes it.
+///
+/// ## Production notes
+///
+/// This reads the entire log into memory on every call. Fine for
+/// pilot scale (10s of MB max); for SaaS we'll move to a streaming
+/// JSONL response and per-tenant log shards.
 async fn export_audit(
     State(state): State<AppState>,
     Query(query): Query<ExportQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<audit::AuditEntry>>, StatusCode> {
+    // ─ Step 1: Pull and validate the auth headers. ─────────────────
+    let signature = headers
+        .get("X-Vyrox-Signature")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let timestamp_str = headers
+        .get("X-Vyrox-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let timestamp: i64 = timestamp_str
+        .trim()
+        .parse()
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    // ─ Step 2: Replay window. ─────────────────────────────────────
+    //
+    // Same window as /execute. A stale `X-Vyrox-Timestamp` cannot be
+    // used to repeatedly fetch a tenant's audit log forever.
+    check_replay_window(timestamp).map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    // ─ Step 3: HMAC verify on the canonical message. ──────────────
+    //
+    // The canonical message is `"<tenant_id>:<timestamp>"`. It binds
+    // the request to (a) the tenant being queried, so an attacker
+    // cannot swap the tenant_id query parameter without invalidating
+    // the signature, and (b) the timestamp, so a replay outside the
+    // window is impossible.
+    let canonical = format!("{}:{}", query.tenant_id, timestamp);
+    if let Err(err) = hmac::verify_signature(
+        state.hmac_secret.as_bytes(),
+        canonical.as_bytes(),
+        signature,
+    ) {
+        warn!(error = %err, "audit export signature verification failed");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    // ─ Step 4: Actual export. ─────────────────────────────────────
     let entries = audit::read_audit_logs(&state.audit_log_path)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -364,8 +434,7 @@ async fn main() {
         warn!("VYROX_HMAC_SECRET is shorter than 32 bytes; consider rotating to a longer key");
     }
 
-    let audit_log_path =
-        env::var("AUDIT_LOG_PATH").unwrap_or_else(|_| "./audit.jsonl".to_string());
+    let audit_log_path = env::var("AUDIT_LOG_PATH").unwrap_or_else(|_| "./audit.jsonl".to_string());
 
     // Safe-by-default: DRY_RUN is TRUE unless explicitly turned off.
     // Operators who want real execution must opt in.
@@ -375,12 +444,18 @@ async fn main() {
     // contract — secrets are read from env there, not here.
     let edr = edr::EdrClient::from_env();
 
+    // Seed the audit chain from the existing log file so a restart
+    // continues the chain instead of branching from genesis. New
+    // deployments with no log file fall through to the genesis hash.
+    let audit_chain = audit::ChainState::from_file(&audit_log_path).await;
+
     let state = AppState {
         hmac_secret,
         audit_log_path,
         dry_run,
         nonces: nonce::NonceStore::new(),
         edr,
+        audit_chain,
     };
 
     let app = Router::new()
