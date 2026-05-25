@@ -54,6 +54,6 @@ No bounty program is active during alpha.
 ## Known Limitations
 
 - `DRY_RUN=true` is expected in non-production environments and intentionally short-circuits EDR side effects.
-- Free-tier infrastructure constraints may affect throughput during burst loads.
+- Infrastructure capacity constraints may affect throughput during burst loads.
 
 These are operational constraints, not vulnerabilities.
