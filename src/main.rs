@@ -529,24 +529,28 @@ async fn main() {
         }
         (None, None) => {
             // Plain HTTP. Intended for deployment behind a TLS-terminating
-            // reverse proxy (Cloudflare Tunnel, Caddy, nginx). NOT for
-            // direct internet exposure. Warn loudly if we're binding a
-            // non-loopback address in cleartext without an explicit
-            // acknowledgement — that exposes signed-but-cleartext containment
-            // traffic if there is no proxy in front. (Warn, not panic: plain
-            // HTTP on 0.0.0.0 behind a reverse proxy is a supported setup.)
+            // reverse proxy (Cloudflare Tunnel, Caddy, nginx). NOT for direct
+            // internet exposure: /execute carries hostnames + action types and
+            // /audit/export returns a tenant's full containment history, all in
+            // cleartext over plain HTTP (signed for integrity, NOT encrypted).
+            //
+            // Fail CLOSED on a non-loopback plaintext bind unless the operator
+            // explicitly acknowledges with ALLOW_INSECURE=true. A warning was
+            // not enough — a misconfigured deploy would happily serve cleartext
+            // containment traffic to the internet (CSO finding #7). Insecure
+            // modes must be opted into, never reached by omission.
             let allow_insecure = parse_bool_env("ALLOW_INSECURE", false);
             let is_loopback = bind_addr
                 .parse::<std::net::SocketAddr>()
                 .map(|a| a.ip().is_loopback())
                 .unwrap_or(false);
             if !is_loopback && !allow_insecure {
-                warn!(
-                    addr = %bind_addr,
-                    "binding plain HTTP to a non-loopback address: containment \
-                     traffic is cleartext unless a TLS-terminating reverse proxy \
-                     sits in front. Set TLS_CERT_PATH/TLS_KEY_PATH, bind 127.0.0.1, \
-                     or set ALLOW_INSECURE=true to acknowledge."
+                panic!(
+                    "refusing to bind plain HTTP to a non-loopback address ({bind_addr}): \
+                     containment + audit traffic would be cleartext. Set \
+                     TLS_CERT_PATH/TLS_KEY_PATH for direct TLS, bind 127.0.0.1 behind a \
+                     TLS-terminating reverse proxy, or set ALLOW_INSECURE=true to \
+                     acknowledge the risk explicitly."
                 );
             }
             info!(addr = %bind_addr, tls = false, dry_run, "vyrox proxy starting (plain HTTP)");
