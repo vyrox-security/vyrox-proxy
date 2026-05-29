@@ -144,12 +144,21 @@ impl NonceStore {
     ///
     /// See [`Outcome`].
     pub fn claim_or_replay(&self, request_id: &str) -> Outcome {
-        // First, run eviction opportunistically. We do this on the read
-        // path so memory is reclaimed even if no background task runs.
-        // Eviction is fast (O(N) worst case) but only triggered when the
-        // table is at or above the soft cap to amortize the cost.
+        // Run eviction opportunistically on the read path so memory is
+        // reclaimed even if no background task runs. Only triggered at/above
+        // the cap to amortize the cost.
         if self.inner.len() >= MAX_RECORDS {
+            // First drop anything past its TTL.
             self.evict_expired();
+            // TTL eviction alone does NOT bound memory: an adversary (or a
+            // genuine storm) sending > MAX_RECORDS unique request_ids inside
+            // the RETENTION window leaves every record younger than the
+            // cutoff, so `evict_expired` frees nothing and the map grows
+            // without bound. Enforce the hard cap by dropping the oldest
+            // entries. This is the bounded-memory guarantee the cap promises.
+            if self.inner.len() >= MAX_RECORDS {
+                self.evict_to_cap();
+            }
         }
 
         // `entry().or_insert_with(...)` atomically inserts the InFlight
@@ -227,6 +236,36 @@ impl NonceStore {
         let cutoff = Duration::from_secs(RETENTION_SECONDS);
         self.inner
             .retain(|_, record| record.created_at.elapsed() < cutoff);
+    }
+
+    /// Enforce the hard cap by dropping the oldest entries.
+    ///
+    /// Called only when the map is still at/above `MAX_RECORDS` after TTL
+    /// eviction — i.e. a burst of unique request_ids all younger than
+    /// `RETENTION_SECONDS`. We bring the map down to 90% of the cap so the
+    /// O(N log N) sort amortizes over many subsequent claims instead of
+    /// running on every insert at the boundary.
+    ///
+    /// Collect keys first (fully draining the iterator) before removing, so
+    /// we never hold a `DashMap` iteration guard and a write guard on the
+    /// same shard at once.
+    fn evict_to_cap(&self) {
+        let len = self.inner.len();
+        let target = MAX_RECORDS / 10 * 9; // 90% of the cap
+        let to_remove = len.saturating_sub(target);
+        if to_remove == 0 {
+            return;
+        }
+
+        let mut entries: Vec<(String, Instant)> = self
+            .inner
+            .iter()
+            .map(|e| (e.key().clone(), e.value().created_at))
+            .collect();
+        entries.sort_by_key(|(_, created)| *created); // oldest first
+        for (key, _) in entries.into_iter().take(to_remove) {
+            self.inner.remove(&key);
+        }
     }
 
     /// Test-only helper to inspect map size.
@@ -311,5 +350,23 @@ mod tests {
             .filter(|b| *b)
             .count();
         assert_eq!(fresh_wins, 1, "exactly one claim must win FreshClaim");
+    }
+
+    #[test]
+    fn unique_id_burst_is_bounded_by_hard_cap() {
+        // A burst of more than MAX_RECORDS unique request_ids, all younger
+        // than RETENTION_SECONDS, must NOT grow the map without bound. TTL
+        // eviction frees nothing here (everything is fresh), so the hard-cap
+        // eviction is what keeps memory bounded. Regression for the OOM gap.
+        let store = NonceStore::new();
+        for i in 0..(MAX_RECORDS + 1_000) {
+            let _ = store.claim_or_replay(&format!("burst-{i}"));
+        }
+        assert!(
+            store.len() <= MAX_RECORDS,
+            "nonce store exceeded the hard cap: {} > {}",
+            store.len(),
+            MAX_RECORDS
+        );
     }
 }
