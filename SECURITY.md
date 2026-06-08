@@ -13,7 +13,7 @@ Versions before `v0.1.0` are not supported and should not be deployed.
 
 Do not open public GitHub issues for vulnerabilities.
 
-Email: `sec.vyrox@proton.me`
+Email: `security@vyrox.dev`
 
 Subject format:
 

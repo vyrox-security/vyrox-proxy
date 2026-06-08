@@ -100,7 +100,7 @@ Do not submit changes that weaken HMAC verification, bypass the rate limiter, or
 
 See CONTRIBUTING.md for the full process. The project is in alpha and external contributions are accepted selectively for security-critical paths.
 
-Security contact: sec.vyrox@proton.me
+Security contact: security@vyrox.dev
 
 ## Licence
 
