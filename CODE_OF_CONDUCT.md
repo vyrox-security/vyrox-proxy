@@ -22,4 +22,4 @@ This repository contains security execution code that can isolate production hos
 
 Maintainers may edit, lock, remove, or restrict participation for behavior that degrades project safety or review quality.
 
-Security concerns: security@vyrox.security
+Security concerns: security@vyrox.dev
