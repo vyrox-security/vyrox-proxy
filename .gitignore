@@ -17,3 +17,14 @@ Cargo.lock
 .vscode/
 .DS_Store
 Thumbs.db
+# Local tooling and editor config (not committed)
+CLAUDE.md
+.claude/
+AGENTS.md
+GEMINI.md
+.cursor/
+.cursorrules
+.aider*
+.gstack/
+.mcp.json
+.claude.json
