@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         Before filing: check that this is not a known limitation in SECURITY.md.
-        If this is a security vulnerability, do not file here. Email security@vyrox.security.
+        If this is a security vulnerability, do not file here. Email security@vyrox.dev.
 
   - type: textarea
     id: what-happened
@@ -73,5 +73,5 @@ body:
           required: true
         - label: I redacted all secrets and tenant data.
           required: true
-        - label: This is not a security vulnerability. If it is, I will email security@vyrox.security.
+        - label: This is not a security vulnerability. If it is, I will email security@vyrox.dev.
           required: true
