@@ -460,9 +460,44 @@ fn parse_bool_env(name: &str, default: bool) -> bool {
     }
 }
 
+/// Initialize Sentry error tracking (T31).
+///
+/// Reads `SENTRY_DSN` from the environment. When it is unset or empty the
+/// returned guard is a no-op — `sentry::init` with an empty DSN installs no
+/// transport and sends nothing, so dev/CI and unconfigured deploys are
+/// unaffected. The caller MUST hold the returned guard for the life of the
+/// process; dropping it flushes and shuts the client down.
+fn init_sentry() -> sentry::ClientInitGuard {
+    let dsn = env::var("SENTRY_DSN").unwrap_or_default();
+    if dsn.trim().is_empty() {
+        info!("Sentry disabled (SENTRY_DSN not set)");
+    } else {
+        info!("Sentry enabled");
+    }
+    let environment = env::var("SENTRY_ENVIRONMENT").ok().map(Into::into);
+    sentry::init((
+        dsn,
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            environment,
+            ..Default::default()
+        },
+    ))
+}
+
 /// Application entry point.
+fn main() {
+    // Sentry must be initialized BEFORE the async runtime so panics in the
+    // runtime setup are captured, and the guard must outlive the server.
+    // sentry::init returns a no-op guard when SENTRY_DSN is unset.
+    let _sentry_guard = init_sentry();
+    run();
+}
+
+/// Build the Tokio runtime and run the server. Split out from `main` so the
+/// Sentry guard in `main` outlives the entire async lifetime.
 #[tokio::main]
-async fn main() {
+async fn run() {
     tracing_subscriber::fmt::init();
 
     // Required: secret used for HMAC verification. We refuse to start
