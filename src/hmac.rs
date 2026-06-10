@@ -7,15 +7,15 @@
 //!
 //! ## Security Properties
 //!
-//! - **HMAC-SHA256** — industry-standard authenticated MAC. 32-byte output.
-//! - **Constant-time comparison** — uses `subtle::ConstantTimeEq` so the
+//! - **HMAC-SHA256** - industry-standard authenticated MAC. 32-byte output.
+//! - **Constant-time comparison** - uses `subtle::ConstantTimeEq` so the
 //!   number of CPU cycles spent comparing two signatures does not depend on
 //!   how many leading bytes match. Defeats timing side-channel attacks where
 //!   an attacker measures response latency to learn the expected signature
 //!   one byte at a time.
-//! - **Algorithm prefix** (`sha256=`) — allows for future migration to
+//! - **Algorithm prefix** (`sha256=`) - allows for future migration to
 //!   stronger MACs without breaking older clients.
-//! - **Generic error messages** — error strings never leak which part of the
+//! - **Generic error messages** - error strings never leak which part of the
 //!   verification failed (prefix, secret length, signature mismatch all
 //!   collapse to caller-side `UNAUTHORIZED`). Prevents signature enumeration.
 //!
@@ -58,7 +58,7 @@ const ALG_PREFIX: &str = "sha256=";
 ///    that future algorithm rotations are unambiguous.
 /// 2. Hex-decode the supplied signature into raw bytes. If decoding fails
 ///    (odd length, non-hex chars), reject. We compare raw bytes, not hex
-///    strings — hex-string comparison would still be timing-safe with
+///    strings - hex-string comparison would still be timing-safe with
 ///    `ConstantTimeEq`, but raw-byte comparison is half the work and the
 ///    canonical form.
 /// 3. Compute the expected HMAC-SHA256 of `body` using `secret`.
@@ -105,7 +105,7 @@ pub fn verify_signature(secret: &[u8], body: &[u8], supplied: &str) -> Result<()
         .strip_prefix(ALG_PREFIX)
         .ok_or(VerifyError::MissingPrefix)?;
 
-    // 2. Hex-decode. Reject malformed input early — there is no scenario
+    // 2. Hex-decode. Reject malformed input early - there is no scenario
     //    where a typo in the hex string should be silently treated as a
     //    valid-but-mismatched signature.
     let supplied_bytes = hex::decode(hex_sig).map_err(|_| VerifyError::MalformedSignature)?;
@@ -121,7 +121,7 @@ pub fn verify_signature(secret: &[u8], body: &[u8], supplied: &str) -> Result<()
     //
     //    `new_from_slice` only fails if the key length is incompatible with
     //    the underlying hash. SHA-256 HMAC accepts any key length, so this
-    //    error path is in practice unreachable — but we still surface it
+    //    error path is in practice unreachable - but we still surface it
     //    explicitly rather than `expect`-ing, because panicking inside a
     //    request handler turns a config bug into a denial-of-service.
     let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| VerifyError::InvalidSecret)?;
