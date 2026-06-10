@@ -80,6 +80,11 @@ cargo fmt -- --check
 | VYROX_HMAC_SECRET | Yes | None | Shared request signing key [secret] |
 | DRY_RUN | No | true | If true, logs actions and skips live EDR calls |
 | AUDIT_LOG_PATH | No | ./audit.jsonl | Append-only JSONL audit log output path |
+| REDIS_URL | No | None | Redis connection URL for the durable, shared nonce/replay store. When set, request de-duplication survives a restart and works across multiple proxy instances. When unset, the proxy falls back to an in-memory store (single process, lost on restart) and logs a warning. `rediss://` URLs use TLS. |
+| NONCE_REDIS_URL | No | None | Overrides `REDIS_URL` for the nonce store only |
+| NONCE_RETENTION_SECONDS | No | 600 | How long a processed `request_id` is remembered (Redis key TTL) |
+| RATE_LIMIT_PER_TENANT | No | 50 | Requests per second allowed per tenant before that tenant gets 429s. Other tenants are unaffected. |
+| RATE_LIMIT_GLOBAL | No | 1000 | Global requests-per-second safety ceiling across all callers, checked before signature verification to shed floods |
 
 ## Request Authentication
 
