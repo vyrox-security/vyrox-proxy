@@ -23,6 +23,12 @@ hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `sentry` provides error tracking (T31). The guard returned by `sentry::init`
+# is a no-op when no DSN is configured, so dev/CI builds and unconfigured
+# deploys send nothing. We disable default features and opt into only the
+# panic + backtrace integrations to keep the dependency surface small and
+# avoid pulling in a second TLS stack — `rustls` matches axum-server/reqwest.
+sentry = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 sha2 = "0.10"
 # `subtle` provides timing-safe byte comparisons. Used in `hmac::verify_signature`
 # to defeat timing side-channel attacks during signature comparison.
