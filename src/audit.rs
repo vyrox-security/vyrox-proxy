@@ -63,7 +63,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 /// Sentinel value used as `previous_hash` for the first entry in a
-/// brand-new log file. Sixty-four ASCII zeros — chosen because the
+/// brand-new log file. Sixty-four ASCII zeros - chosen because the
 /// Python side uses the same convention so both chains agree on what
 /// "no predecessor" looks like.
 pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -96,7 +96,7 @@ pub struct AuditEntry {
 
     /// SHA-256 hash of the previous entry (or `GENESIS_HASH` for
     /// the very first entry). Together with `hash` this forms the
-    /// tamper-evident chain — see module docs.
+    /// tamper-evident chain - see module docs.
     #[serde(default = "default_genesis")]
     pub previous_hash: String,
 
@@ -116,7 +116,7 @@ fn default_genesis() -> String {
 /// The state is shared (via `Arc<Mutex<...>>`) so concurrent
 /// `append_audit` calls serialize at the chain boundary. The mutex
 /// is held only for the brief window between "read last hash" and
-/// "write new entry," which is microseconds — there is no real
+/// "write new entry," which is microseconds - there is no real
 /// contention at our request rates.
 #[derive(Clone)]
 pub struct ChainState {
@@ -147,7 +147,7 @@ impl ChainState {
     /// Reads the file, finds the last well-formed entry, and uses its
     /// `hash` as the seed. If the file does not exist or is empty,
     /// the chain starts at `GENESIS_HASH`. Errors fall through to
-    /// genesis as well — better to start fresh than to refuse to
+    /// genesis as well - better to start fresh than to refuse to
     /// boot. If you want strict mode, swap in a fail-loud helper.
     pub async fn from_file(path: &str) -> Self {
         let last = read_last_hash(path)
@@ -185,7 +185,7 @@ pub async fn append_audit(
     // Stamp the chain link before computing the hash so the hash
     // covers the linkage too.
     entry.previous_hash = guard.last_hash.clone();
-    entry.hash = String::new(); // explicit — hash never participates in its own input
+    entry.hash = String::new(); // explicit - hash never participates in its own input
 
     let computed = compute_entry_hash(&entry);
     entry.hash = computed.clone();
@@ -360,7 +360,7 @@ mod tests {
         let tmp = NamedTempFile::new().expect("tmp");
         let path = tmp.path().to_str().unwrap().to_string();
 
-        // "First boot" — write one entry.
+        // "First boot" - write one entry.
         let state1 = ChainState::genesis();
         let entry_a = build_entry(
             "t1".into(),
@@ -375,7 +375,7 @@ mod tests {
         let entries = read_audit_logs(&path).await.expect("read");
         let saved_hash = entries[0].hash.clone();
 
-        // "Restart" — load chain state from the existing file.
+        // "Restart" - load chain state from the existing file.
         let state2 = ChainState::from_file(&path).await;
         {
             let guard = state2.inner.lock().await;

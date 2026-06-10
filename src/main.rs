@@ -45,6 +45,8 @@ use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use dashmap::DashMap;
+
 use axum::body::Bytes;
 use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -68,12 +70,33 @@ mod nonce;
 /// timestamps caused by client clock skew or deliberate manipulation.
 const REPLAY_WINDOW_SECONDS: i64 = 30;
 
-/// Maximum requests served per rolling one-second window across the whole
-/// proxy. Generous enough not to interfere with a real incident burst, low
-/// enough to shed an unauthenticated flood before it reaches HMAC verification
-/// (a CPU-DoS vector even though forgery is infeasible). Global rather than
-/// per-IP so it needs no client-IP plumbing through the two serve paths.
-const RATE_LIMIT_PER_SECOND: u32 = 100;
+/// Default per-tenant request budget per one-second window. One tenant's
+/// containment burst can consume at most this many slots per second; once it
+/// is exhausted, only THAT tenant gets 429s. Every other tenant's
+/// human-approved actions are unaffected, which is the whole point of moving
+/// off the old single global counter. Override with `RATE_LIMIT_PER_TENANT`.
+const DEFAULT_RATE_LIMIT_PER_TENANT: u32 = 50;
+
+/// Default global safety ceiling per one-second window across ALL tenants and
+/// all unauthenticated callers. This is the flood shield: it runs in the
+/// middleware before HMAC verification, so an unauthenticated flood is shed
+/// before it can burn CPU on signature checks (a CPU-DoS vector even though
+/// forgery is infeasible). Sized well above the sum of normal per-tenant
+/// traffic so it never clips legitimate load; it only trips under an actual
+/// flood. Override with `RATE_LIMIT_GLOBAL`.
+const DEFAULT_RATE_LIMIT_GLOBAL: u32 = 1_000;
+
+/// Env var names for the two configurable rate limits.
+const RATE_LIMIT_PER_TENANT_VAR: &str = "RATE_LIMIT_PER_TENANT";
+const RATE_LIMIT_GLOBAL_VAR: &str = "RATE_LIMIT_GLOBAL";
+
+/// Upper bound on the number of distinct tenants tracked at once. Each tracked
+/// tenant costs one small fixed-window counter. The cap stops an attacker who
+/// forges (un-signed, so they 401 anyway, but the per-tenant check runs only
+/// after HMAC, so in practice only real tenants reach it) or a pathological
+/// fan-out from growing the map without bound. At the cap we drop the oldest
+/// idle windows. 50k comfortably exceeds the 50+ partner target with headroom.
+const MAX_TRACKED_TENANTS: usize = 50_000;
 
 /// Application state. Cloned into every request handler, so anything
 /// inside must be cheap to clone (Arc-wrapped data, primitives, etc.).
@@ -102,10 +125,116 @@ struct AppState {
     /// See `audit::ChainState`.
     audit_chain: audit::ChainState,
 
-    /// Fixed-window global rate-limit counter: (window start, count in
-    /// window). Shared across handlers to shed request floods. See
-    /// `rate_limit` / `rate_check`.
-    rate: Arc<Mutex<(Instant, u32)>>,
+    /// Two-tier rate limiter: a per-tenant fixed-window budget (checked after
+    /// the signed request is parsed, so one tenant's burst only 429s that
+    /// tenant) plus a global safety ceiling (checked in the middleware before
+    /// HMAC, to shed unauthenticated floods). See `RateLimiter`.
+    rate: RateLimiter,
+}
+
+/// Two-tier fixed-window rate limiter.
+///
+/// The original limiter was a single global counter, so one tenant's
+/// containment burst 429'd every other tenant's human-approved actions. This
+/// splits the budget:
+///
+/// - **Per tenant** (`per_tenant` limit): keyed by `tenant_id` from the signed
+///   request body, so tenant A burning its budget never blocks tenant B. This
+///   check necessarily runs AFTER HMAC verification and JSON parsing, because
+///   that is the first point the tenant_id is known and trustworthy.
+/// - **Global** (`global` limit): a single counter across every request,
+///   checked in the middleware BEFORE HMAC so an unauthenticated flood is shed
+///   cheaply. Sized high so it only trips under an actual flood, never on
+///   normal multi-tenant load.
+///
+/// Both windows are one second. Limits are read from the environment once at
+/// construction. The per-tenant counters live in a `DashMap` so concurrent
+/// tenants do not contend on a single lock; the map is capped
+/// (`MAX_TRACKED_TENANTS`) and sheds the oldest idle windows when full.
+#[derive(Clone)]
+struct RateLimiter {
+    /// Per-tenant request budget per one-second window.
+    per_tenant_limit: u32,
+    /// Global request ceiling per one-second window across all callers.
+    global_limit: u32,
+    /// Per-tenant fixed-window counters: tenant_id -> (window start, count).
+    tenants: Arc<DashMap<String, (Instant, u32)>>,
+    /// The single global fixed-window counter: (window start, count).
+    global: Arc<Mutex<(Instant, u32)>>,
+}
+
+impl RateLimiter {
+    /// Build the limiter, reading both limits from the environment.
+    ///
+    /// `RATE_LIMIT_PER_TENANT` and `RATE_LIMIT_GLOBAL` override the defaults; a
+    /// missing, blank, or zero value falls back to the default (a zero limit
+    /// would wedge the proxy, so it is rejected as a misconfiguration).
+    fn from_env() -> Self {
+        let per_tenant_limit =
+            parse_u32_env(RATE_LIMIT_PER_TENANT_VAR, DEFAULT_RATE_LIMIT_PER_TENANT);
+        let global_limit = parse_u32_env(RATE_LIMIT_GLOBAL_VAR, DEFAULT_RATE_LIMIT_GLOBAL);
+        info!(
+            per_tenant_limit,
+            global_limit, "rate limiter: per-tenant + global ceiling (per one-second window)"
+        );
+        Self {
+            per_tenant_limit,
+            global_limit,
+            tenants: Arc::new(DashMap::new()),
+            global: Arc::new(Mutex::new((Instant::now(), 0))),
+        }
+    }
+
+    /// Check (and consume) one slot against the global ceiling.
+    ///
+    /// Runs in the middleware before HMAC verification. Returns true if the
+    /// request is allowed.
+    fn check_global(&self, now: Instant) -> bool {
+        let mut window = self
+            .global
+            .lock()
+            .expect("global rate-limit mutex poisoned");
+        rate_check(&mut window, now, self.global_limit)
+    }
+
+    /// Check (and consume) one slot against a single tenant's budget.
+    ///
+    /// Runs after the signed body is parsed. Each tenant gets an independent
+    /// fixed-window counter, so one tenant exhausting its budget returns 429
+    /// only for that tenant. Returns true if the request is allowed.
+    fn check_tenant(&self, tenant_id: &str, now: Instant) -> bool {
+        // Bound the number of tracked tenants. Only sweep at the cap so the
+        // O(N) eviction amortizes; under the 50+ partner target this never
+        // runs, it only defends against a pathological tenant-id fan-out.
+        if self.tenants.len() >= MAX_TRACKED_TENANTS {
+            self.evict_idle_tenants(now);
+        }
+
+        let mut window = self
+            .tenants
+            .entry(tenant_id.to_string())
+            .or_insert_with(|| (now, 0));
+        rate_check(&mut window, now, self.per_tenant_limit)
+    }
+
+    /// Drop tenant windows that have rolled over (idle for at least one full
+    /// window), bringing the map back under the cap. Collect keys first so we
+    /// never hold an iteration guard and a write guard on the same shard.
+    fn evict_idle_tenants(&self, now: Instant) {
+        let stale: Vec<String> = self
+            .tenants
+            .iter()
+            .filter(|e| now.duration_since(e.value().0).as_secs() >= 1)
+            .map(|e| e.key().clone())
+            .collect();
+        for key in stale {
+            // Remove only if still idle, so we never evict a tenant that just
+            // opened a fresh window between the scan and the remove.
+            self.tenants.remove_if(&key, |_, (start, _)| {
+                now.duration_since(*start).as_secs() >= 1
+            });
+        }
+    }
 }
 
 /// Pure rate-limit decision over a fixed one-second window. Extracted from
@@ -119,15 +248,13 @@ fn rate_check(window: &mut (Instant, u32), now: Instant, limit: u32) -> bool {
     window.1 <= limit
 }
 
-/// Axum middleware applying the global fixed-window rate limit. Returns
-/// 429 Too Many Requests once the per-second budget is exhausted.
+/// Axum middleware applying the GLOBAL safety ceiling before HMAC. Returns
+/// 429 Too Many Requests once the global per-second budget is exhausted. The
+/// per-tenant budget is enforced separately inside `run_action`, after the
+/// signed body is parsed and the tenant_id is known.
 async fn rate_limit(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    let allowed = {
-        let mut window = state.rate.lock().expect("rate-limit mutex poisoned");
-        rate_check(&mut window, Instant::now(), RATE_LIMIT_PER_SECOND)
-    };
-    if !allowed {
-        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+    if !state.rate.check_global(Instant::now()) {
+        return (StatusCode::TOO_MANY_REQUESTS, "global rate limit exceeded").into_response();
     }
     next.run(req).await
 }
@@ -258,6 +385,18 @@ async fn rollback(
     run_action(state, headers, body, actions::ActionDirection::Reverse).await
 }
 
+/// Release a nonce claim, logging (not propagating) a store error.
+///
+/// Release is best-effort: it only runs on an error path where we are already
+/// returning a failure status. If the release itself fails (Redis blip) the
+/// stale in-flight key simply TTLs out on its own, so there is nothing useful
+/// to do with the error but record it.
+async fn release_nonce(nonces: &nonce::NonceStore, request_id: &str) {
+    if let Err(err) = nonces.release_claim(request_id).await {
+        warn!(error = %err, request_id, "failed to release nonce claim (will TTL out)");
+    }
+}
+
 /// Shared lifecycle for `/execute` and `/rollback` - the security-critical
 /// entry point.
 ///
@@ -301,6 +440,21 @@ async fn run_action(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // ─ Step 2b: Per-tenant rate limit. ────────────────────────────────
+    //
+    // Enforced here, after the body is parsed, because this is the first
+    // point the tenant_id is known and trustworthy (it is inside the
+    // HMAC-signed body). Keyed by tenant_id so one tenant's containment burst
+    // returns 429 only for THAT tenant, never for another tenant's
+    // human-approved action. The global ceiling already ran in the middleware.
+    if !state.rate.check_tenant(&payload.tenant_id, Instant::now()) {
+        warn!(
+            tenant_id = %payload.tenant_id,
+            "per-tenant rate limit exceeded"
+        );
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
     // ─ Step 3: Replay window. ─────────────────────────────────────────
     check_replay_window(payload.approved_at)?;
 
@@ -308,8 +462,18 @@ async fn run_action(
     //
     // Claim the request_id. If we've already finished this request,
     // return the cached response - the client gets a byte-identical
-    // result and the EDR is NOT called again.
-    match state.nonces.claim_or_replay(&payload.request_id) {
+    // result and the EDR is NOT called again. A nonce-store transport
+    // error (Redis down) fails CLOSED with a 503: skipping dedup could
+    // double-execute a containment, so we refuse rather than guess.
+    let claim = state
+        .nonces
+        .claim_or_replay(&payload.request_id)
+        .await
+        .map_err(|err| {
+            warn!(error = %err, "nonce store unavailable; failing closed");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+    match claim {
         nonce::Outcome::FreshClaim => { /* fall through to execution */ }
         nonce::Outcome::AlreadyExecuted {
             cached_response_json,
@@ -350,7 +514,7 @@ async fn run_action(
         // forensic trail. Release the nonce so the bot can retry once
         // the underlying issue (disk full, perm error) is fixed.
         warn!(error = %err, "audit write failed; releasing nonce claim");
-        state.nonces.release_claim(&payload.request_id);
+        release_nonce(&state.nonces, &payload.request_id).await;
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -401,7 +565,7 @@ async fn run_action(
                     error = %err,
                     "EDR dispatch failed; releasing nonce claim"
                 );
-                state.nonces.release_claim(&payload.request_id);
+                release_nonce(&state.nonces, &payload.request_id).await;
                 return Err(StatusCode::BAD_GATEWAY);
             }
         }
@@ -410,11 +574,25 @@ async fn run_action(
     // ─ Step 7: Cache the response for future retries. ────────────────
     //
     // Serialize once so subsequent replays return byte-identical output.
+    // The action already happened and was audited; if caching the response
+    // fails (Redis blip) we log and still return success rather than 500 a
+    // completed containment. The worst case is that a retry re-executes an
+    // idempotent EDR action, which the replay window and EDR idempotency both
+    // bound, and which is strictly safer than reporting a failure for an action
+    // that succeeded.
     let cache_payload =
         serde_json::to_string(&response).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    state
+    if let Err(err) = state
         .nonces
-        .record_response(&payload.request_id, cache_payload);
+        .record_response(&payload.request_id, cache_payload)
+        .await
+    {
+        warn!(
+            request_id = %payload.request_id,
+            error = %err,
+            "failed to cache response in nonce store; action already executed and audited"
+        );
+    }
 
     Ok(Json(response))
 }
@@ -505,6 +683,34 @@ async fn export_audit(
         .collect();
 
     Ok(Json(filtered))
+}
+
+/// Parse a positive `u32` environment variable.
+///
+/// A missing, blank, unparseable, or zero value falls back to `default`. Zero
+/// is rejected because a zero rate limit would wedge the proxy (every request
+/// 429s), which is never the intended config; we warn and use the default so a
+/// fat-fingered limit fails safe rather than taking the proxy down.
+fn parse_u32_env(name: &str, default: u32) -> u32 {
+    match env::var(name) {
+        Ok(value) => match value.trim().parse::<u32>() {
+            Ok(parsed) if parsed > 0 => parsed,
+            Ok(_) => {
+                warn!(var = name, "rate limit of 0 is invalid; using default");
+                default
+            }
+            Err(_) => {
+                warn!(
+                    var = name,
+                    value = value.trim(),
+                    default,
+                    "unparseable rate-limit env var; using default"
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
 }
 
 /// Parse a boolean-ish environment variable.
@@ -609,14 +815,28 @@ async fn run() {
     // deployments with no log file fall through to the genesis hash.
     let audit_chain = audit::ChainState::from_file(&audit_log_path).await;
 
+    // Build the nonce/replay store. Prefers a durable Redis backend
+    // (NONCE_REDIS_URL/REDIS_URL); falls back to in-memory with a loud warning
+    // when no Redis URL is set. A configured-but-unreachable Redis is a hard
+    // boot error, the operator asked for durability and we will not silently
+    // downgrade to the restart-double-execute path.
+    let nonces = nonce::NonceStore::from_env()
+        .await
+        .expect("failed to connect to the configured Redis nonce store");
+    if nonces.is_durable() {
+        info!("nonce store backend: redis (durable, shared)");
+    } else {
+        info!("nonce store backend: in-memory (NOT durable; dev/CI only)");
+    }
+
     let state = AppState {
         hmac_secret,
         audit_log_path,
         dry_run,
-        nonces: nonce::NonceStore::new(),
+        nonces,
         edr,
         audit_chain,
-        rate: Arc::new(Mutex::new((Instant::now(), 0))),
+        rate: RateLimiter::from_env(),
     };
 
     let app = build_router(state);
@@ -707,6 +927,87 @@ mod tests {
         assert!(rate_check(&mut window, later, 1));
     }
 
+    /// Build a limiter with explicit limits for the rate-limiter unit tests.
+    fn limiter(per_tenant: u32, global: u32) -> RateLimiter {
+        RateLimiter {
+            per_tenant_limit: per_tenant,
+            global_limit: global,
+            tenants: Arc::new(DashMap::new()),
+            global: Arc::new(Mutex::new((Instant::now(), 0))),
+        }
+    }
+
+    #[test]
+    fn per_tenant_budget_isolates_one_tenant_from_another() {
+        // Per-tenant budget of 2, generous global ceiling. Tenant A burns its
+        // budget; tenant B is completely unaffected. This is the core property
+        // the old single global counter could not provide.
+        let rl = limiter(2, 1_000);
+        let now = Instant::now();
+
+        assert!(rl.check_tenant("tenant-a", now), "A #1 allowed");
+        assert!(rl.check_tenant("tenant-a", now), "A #2 allowed");
+        assert!(!rl.check_tenant("tenant-a", now), "A #3 over its budget");
+
+        // Tenant B has its own fresh budget despite A being throttled.
+        assert!(rl.check_tenant("tenant-b", now), "B #1 allowed");
+        assert!(rl.check_tenant("tenant-b", now), "B #2 allowed");
+        assert!(
+            !rl.check_tenant("tenant-b", now),
+            "B #3 over ITS own budget"
+        );
+    }
+
+    #[test]
+    fn per_tenant_window_resets_after_one_second() {
+        let rl = limiter(1, 1_000);
+        let start = Instant::now();
+        assert!(rl.check_tenant("t", start));
+        assert!(!rl.check_tenant("t", start), "2nd in same window blocked");
+        let later = start + Duration::from_secs(2);
+        assert!(rl.check_tenant("t", later), "fresh window after 1s");
+    }
+
+    #[test]
+    fn global_ceiling_sheds_flood_across_all_callers() {
+        // The global ceiling does not care about tenant identity: it caps total
+        // throughput so an unauthenticated flood is shed before HMAC.
+        let rl = limiter(1_000, 2);
+        let now = Instant::now();
+        assert!(rl.check_global(now));
+        assert!(rl.check_global(now));
+        assert!(!rl.check_global(now), "3rd request over the global ceiling");
+    }
+
+    #[test]
+    fn tenant_map_is_bounded_and_evicts_idle_windows() {
+        // Fill far past a tiny logical view of the cap by using rolled-over
+        // windows, then confirm eviction reclaims idle entries. We exercise the
+        // eviction helper directly rather than allocating 50k entries.
+        let rl = limiter(5, 1_000);
+        let t0 = Instant::now();
+        for i in 0..1_000 {
+            let _ = rl.check_tenant(&format!("tenant-{i}"), t0);
+        }
+        assert_eq!(rl.tenants.len(), 1_000);
+        // One second later every window is idle; eviction clears them all.
+        let t1 = t0 + Duration::from_secs(2);
+        rl.evict_idle_tenants(t1);
+        assert_eq!(rl.tenants.len(), 0, "idle windows should be evicted");
+    }
+
+    #[test]
+    fn parse_u32_env_rejects_zero_and_garbage() {
+        std::env::set_var("VYROX_TEST_RL", "0");
+        assert_eq!(parse_u32_env("VYROX_TEST_RL", 50), 50, "zero -> default");
+        std::env::set_var("VYROX_TEST_RL", "notnum");
+        assert_eq!(parse_u32_env("VYROX_TEST_RL", 50), 50, "garbage -> default");
+        std::env::set_var("VYROX_TEST_RL", "7");
+        assert_eq!(parse_u32_env("VYROX_TEST_RL", 50), 7, "valid -> parsed");
+        std::env::remove_var("VYROX_TEST_RL");
+        assert_eq!(parse_u32_env("VYROX_TEST_RL", 50), 50, "unset -> default");
+    }
+
     // ── HTTP-level lifecycle tests for /execute and /rollback ──────────
     //
     // These drive the assembled router in-process with `tower::oneshot`,
@@ -722,19 +1023,40 @@ mod tests {
 
     const TEST_SECRET: &str = "test-secret-32-bytes-long-padding!!";
 
+    /// A rate limiter with generous limits for the default lifecycle tests, so
+    /// the rate path never interferes with the security-path assertions.
+    fn permissive_limiter() -> RateLimiter {
+        RateLimiter {
+            per_tenant_limit: 10_000,
+            global_limit: 10_000,
+            tenants: Arc::new(DashMap::new()),
+            global: Arc::new(Mutex::new((Instant::now(), 0))),
+        }
+    }
+
     /// Build a router with a known secret and a temp audit log. `dry_run`
     /// toggles the EDR short-circuit; `edr` is the global fallback client.
     fn test_router(dry_run: bool, edr: edr::EdrClient) -> (Router, TempDir) {
+        test_router_with_limiter(dry_run, edr, permissive_limiter())
+    }
+
+    /// Same as `test_router` but with a caller-supplied limiter, so the
+    /// per-tenant isolation test can set a tiny per-tenant budget.
+    fn test_router_with_limiter(
+        dry_run: bool,
+        edr: edr::EdrClient,
+        rate: RateLimiter,
+    ) -> (Router, TempDir) {
         let dir = TempDir::new().expect("tempdir");
         let audit_log_path = dir.path().join("audit.jsonl").to_str().unwrap().to_string();
         let state = AppState {
             hmac_secret: TEST_SECRET.to_string(),
             audit_log_path,
             dry_run,
-            nonces: nonce::NonceStore::new(),
+            nonces: nonce::NonceStore::in_memory(),
             edr,
             audit_chain: audit::ChainState::genesis(),
-            rate: Arc::new(Mutex::new((Instant::now(), 0))),
+            rate,
         };
         (build_router(state), dir)
     }
@@ -759,11 +1081,21 @@ mod tests {
     }
 
     /// Build a request body for `/execute` or `/rollback`. `creds` is the
-    /// optional per-tenant credential blob.
+    /// optional per-tenant credential blob. Tenant defaults to "tenant-a".
     fn action_body(request_id: &str, creds: Option<serde_json::Value>) -> Vec<u8> {
+        action_body_for("tenant-a", request_id, creds)
+    }
+
+    /// As `action_body` but with an explicit tenant_id, for the per-tenant
+    /// rate-limit isolation test.
+    fn action_body_for(
+        tenant_id: &str,
+        request_id: &str,
+        creds: Option<serde_json::Value>,
+    ) -> Vec<u8> {
         let mut obj = json!({
             "request_id": request_id,
-            "tenant_id": "tenant-a",
+            "tenant_id": tenant_id,
             "alert_id": "alert-1",
             "action_type": "HOST_ISOLATION",
             "host": "device-1",
@@ -920,6 +1252,47 @@ mod tests {
         let (s2, v2) = post_json(&router, "/execute", body).await;
         assert_eq!(s2, StatusCode::OK);
         assert_eq!(v2["status"], "replayed");
+    }
+
+    #[tokio::test]
+    async fn per_tenant_rate_limit_isolates_tenants_over_http() {
+        // Drive the FULL router with a tiny per-tenant budget (2) and a high
+        // global ceiling. Tenant A bursts past its budget and starts getting
+        // 429s; tenant B, sharing the same proxy, is completely unaffected and
+        // still gets 200s. This is the end-to-end proof that one tenant's burst
+        // no longer 429s another tenant's human-approved actions, the gap the
+        // old single global counter left open.
+        let limiter = RateLimiter {
+            per_tenant_limit: 2,
+            global_limit: 10_000,
+            tenants: Arc::new(DashMap::new()),
+            global: Arc::new(Mutex::new((Instant::now(), 0))),
+        };
+        let (router, _dir) = test_router_with_limiter(true, edr::EdrClient::Noop, limiter);
+
+        // Tenant A: first two succeed, the rest are throttled (429).
+        let a1 = action_body_for("tenant-a", "a-1", None);
+        let a2 = action_body_for("tenant-a", "a-2", None);
+        let a3 = action_body_for("tenant-a", "a-3", None);
+        let a4 = action_body_for("tenant-a", "a-4", None);
+        let (sa1, _) = post_json(&router, "/execute", a1).await;
+        let (sa2, _) = post_json(&router, "/execute", a2).await;
+        assert_eq!(sa1, StatusCode::OK, "A #1 ok");
+        assert_eq!(sa2, StatusCode::OK, "A #2 ok");
+        let sa3 = post(&router, "/execute", a3.clone(), Some(sign_body(&a3))).await;
+        let sa4 = post(&router, "/execute", a4.clone(), Some(sign_body(&a4))).await;
+        assert_eq!(sa3, StatusCode::TOO_MANY_REQUESTS, "A #3 throttled");
+        assert_eq!(sa4, StatusCode::TOO_MANY_REQUESTS, "A #4 throttled");
+
+        // Tenant B: untouched by A's burst, both requests succeed.
+        let b1 = action_body_for("tenant-b", "b-1", None);
+        let b2 = action_body_for("tenant-b", "b-2", None);
+        let (sb1, vb1) = post_json(&router, "/execute", b1).await;
+        let (sb2, vb2) = post_json(&router, "/execute", b2).await;
+        assert_eq!(sb1, StatusCode::OK, "B #1 must be ok despite A's burst");
+        assert_eq!(sb2, StatusCode::OK, "B #2 must be ok despite A's burst");
+        assert_eq!(vb1["status"], "dry_run");
+        assert_eq!(vb2["status"], "dry_run");
     }
 
     // ── End-to-end: execute then rollback against a stateful mock EDR ──────

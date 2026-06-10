@@ -40,6 +40,14 @@ thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+# `redis` backs the durable nonce/replay store so dedup state survives a proxy
+# restart and is shared across multiple proxy instances. We use the async tokio
+# connection plus the connection-manager (auto-reconnect, single multiplexed
+# connection). TLS is via rustls to match axum-server/reqwest and avoid pulling
+# in OpenSSL; webpki-roots gives a built-in trust store so `rediss://` works
+# without a system cert bundle. When REDIS_URL is unset the proxy falls back to
+# the in-memory store with a loud warning (see `nonce::NonceStore`).
+redis = { version = "1.2.2", default-features = false, features = ["tokio-comp", "connection-manager", "aio", "script", "tokio-rustls-comp", "tls-rustls", "tls-rustls-webpki-roots"] }
 
 [dev-dependencies]
 # `tempfile` powers test fixtures that need a real on-disk audit log.
