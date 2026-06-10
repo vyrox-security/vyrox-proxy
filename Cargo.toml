@@ -40,3 +40,9 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 # Confined to dev-dependencies so it does not bloat the production
 # binary.
 tempfile = "3"
+# `tower` provides `ServiceExt::oneshot`, which drives the assembled Axum
+# router in-process (no socket, no live EDR) so the full /execute and
+# /rollback HTTP path can be tested end to end.
+tower = { version = "0.5", features = ["util"] }
+# `http-body-util` collects a response body in tests.
+http-body-util = "0.1"

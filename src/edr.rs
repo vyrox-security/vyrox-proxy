@@ -1,56 +1,56 @@
-//! EDR Client — CrowdStrike Falcon integration for the v0.1-alpha pilot.
+//! EDR Client, CrowdStrike Falcon and SentinelOne integration for the pilot.
 //!
 //! ## Why this module exists
 //!
 //! Before this module, `execute` returned the literal string `"executed"`
 //! without ever calling any EDR. The pilot would have demoed a working
-//! UI on top of a no-op proxy — exactly the worst kind of demo bug
+//! UI on top of a no-op proxy, exactly the worst kind of demo bug
 //! (everything looks fine until a real incident).
 //!
 //! This module is the bridge from the proxy's internal `ActionType` to
-//! the actual CrowdStrike Falcon Real Time Response (RTR) APIs.
+//! the actual CrowdStrike Falcon and SentinelOne containment APIs.
 //!
-//! ## Pilot scope
+//! ## Per-tenant credentials (E7)
 //!
-//! The v0.1-alpha pilot targets CrowdStrike Falcon only. SentinelOne is
-//! tracked as a post-pilot integration. We intentionally avoid a trait /
-//! generic-EDR abstraction here because we've seen exactly one EDR API
-//! end-to-end; pre-designing an interface from one example is the kind
-//! of premature abstraction that ages badly.
+//! Vyrox runs ONE central proxy for all tenants (CONSOLE_PLATFORM 8b). The
+//! proxy can no longer read a single global EDR credential from its env: an
+//! action for tenant A must act in tenant A's EDR, with tenant A's API key.
 //!
-//! When SentinelOne lands, we'll refactor to a `trait EdrBackend` based
-//! on the *actual* surface area of both APIs, not a guess.
+//! So the signed request now carries the tenant's decrypted EDR credentials
+//! (`EdrCredentials`). The Python orchestrator decrypts them from
+//! `TenantCredential.*_encrypted` just before the call and includes them in
+//! the body. The proxy uses THOSE for the EDR call. The credentials travel
+//! over TLS (the deploy terminates TLS at the proxy or a reverse proxy in
+//! front of it) and inside the HMAC-signed body, so they are both encrypted
+//! in transit and integrity-protected, a tampered credential blob fails the
+//! signature check before it is ever read.
 //!
-//! ## Configuration
+//! The global env credential (`EdrClient::from_env`) stays as a dev/sandbox
+//! fallback ONLY: it is used when the request carries no per-tenant
+//! credentials, which is the local-dev and CI path. Production always sends
+//! per-tenant creds.
 //!
-//! Environment variables (read in `EdrClient::from_env`):
+//! ## Provider scope
 //!
-//! | Variable                  | Required | Notes                                |
-//! |---------------------------|----------|--------------------------------------|
-//! | `EDR_PROVIDER`            | No       | "crowdstrike" (default) or "noop".   |
-//! | `CROWDSTRIKE_CLIENT_ID`   | When provider=crowdstrike | OAuth2 client id. |
-//! | `CROWDSTRIKE_CLIENT_SECRET` | When provider=crowdstrike | OAuth2 secret. |
-//! | `CROWDSTRIKE_BASE_URL`    | No       | API host. Default `https://api.crowdstrike.com`. |
-//! | `EDR_HTTP_TIMEOUT_SECS`   | No       | Default 30s.                         |
-//!
-//! `EDR_PROVIDER=noop` is the safe default for development and CI —
-//! `dispatch` logs the intent and returns Ok without making any HTTP
-//! call. It is distinct from `DRY_RUN`: DRY_RUN is decided at the
-//! `execute` handler level; `noop` is decided at the client construction
-//! level. Either being active prevents real EDR side effects.
+//! CrowdStrike Falcon (Real Time Response contain/lift) and SentinelOne
+//! (connect/disconnect) are both supported because the per-tenant credential
+//! carries its own `provider` tag, the central proxy serves tenants on
+//! different EDRs at the same time. `noop` remains the safe default when no
+//! credential is configured at all.
 //!
 //! ## Auth
 //!
-//! CrowdStrike Falcon uses OAuth2 client_credentials. We cache the
-//! bearer token in memory until it nears expiry (we refresh at 80% of
-//! `expires_in` to avoid the cliff). The token itself is never logged.
+//! CrowdStrike Falcon uses OAuth2 client_credentials. A per-request client
+//! fetches its own bearer token (no shared cache across tenants, since the
+//! credentials differ per tenant). SentinelOne uses a static API token passed
+//! as `ApiToken` in the `Authorization` header. Tokens are never logged.
 //!
 //! ## Error mapping
 //!
 //! All transport, parsing, and HTTP-status errors collapse into the
-//! `EdrError` enum. The caller (in `main::execute`) maps the error to
-//! `502 Bad Gateway` and releases the nonce so the bot can retry on
-//! fresh state.
+//! `EdrError` enum. The caller (in `main`) maps the error to `502 Bad
+//! Gateway` (for `/execute`) or pages a human (for `/rollback`) and releases
+//! the nonce so a retry can run on fresh state.
 
 use std::env;
 use std::sync::Arc;
@@ -62,7 +62,10 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::actions::ActionType;
+use crate::actions::{ActionDirection, ActionType};
+
+/// Default HTTP timeout for EDR calls, in seconds.
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Errors that can happen during an EDR dispatch.
 ///
@@ -89,18 +92,91 @@ pub enum EdrError {
     /// could not be parsed into the shape we expected.
     #[error("edr returned unexpected response: {0}")]
     UnexpectedResponse(String),
+
+    /// The request did not carry usable credentials and no fallback was
+    /// configured. Surfaced rather than silently no-op so a misconfigured
+    /// production call fails loudly.
+    #[error("edr misconfigured: {0}")]
+    Misconfigured(String),
 }
 
-/// EDR client used by the proxy.
+/// Which EDR a per-tenant credential targets.
 ///
-/// This is a thin enum over the concrete backends. `Noop` exists so
-/// tests and dev runs do not need real credentials.
+/// Carried on `EdrCredentials` so the central proxy can serve tenants on
+/// different EDRs at once: it dispatches on the credential's provider, not
+/// on a single global setting.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EdrProvider {
+    Crowdstrike,
+    Sentinelone,
+}
+
+/// Per-tenant EDR credentials, decrypted by the Python orchestrator and
+/// carried inside the signed request body.
+///
+/// Wire-stable: this is part of the contract with the Python side
+/// (`shared/proxy_client.py`). The whole struct is optional on the request;
+/// when absent the proxy falls back to its global env client (dev/sandbox).
+///
+/// The values are plaintext credentials. They are safe here ONLY because the
+/// whole body is HMAC-signed (integrity) and the transport is TLS
+/// (confidentiality). Never log any field of this struct.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EdrCredentials {
+    /// Which EDR these credentials authenticate against.
+    pub provider: EdrProvider,
+
+    /// CrowdStrike OAuth2 client id, or the principal id for SentinelOne
+    /// (unused there, kept for a uniform shape).
+    pub api_key: String,
+
+    /// CrowdStrike OAuth2 client secret, or the SentinelOne API token.
+    /// Optional because a token-only vendor has no secret half, but at
+    /// least one credential is always required.
+    #[serde(default)]
+    pub api_secret: Option<String>,
+
+    /// Per-tenant EDR API base URL override. Lets the mock EDR (and a
+    /// customer on a non-default CrowdStrike cloud, e.g. US-2 / EU-1) be
+    /// targeted without a global env change. Falls back to the provider's
+    /// default when absent.
+    #[serde(default)]
+    pub base_url: Option<String>,
+}
+
+impl EdrCredentials {
+    /// True if the credentials carry enough to authenticate. A blank api_key
+    /// (or, for token vendors, a blank token) is treated as "not configured"
+    /// so an empty decrypt result falls back rather than failing mid-call.
+    fn is_usable(&self) -> bool {
+        match self.provider {
+            EdrProvider::Crowdstrike => {
+                !self.api_key.trim().is_empty()
+                    && self
+                        .api_secret
+                        .as_ref()
+                        .is_some_and(|s| !s.trim().is_empty())
+            }
+            EdrProvider::Sentinelone => self
+                .api_secret
+                .as_ref()
+                .is_some_and(|s| !s.trim().is_empty()),
+        }
+    }
+}
+
+/// EDR client used by the proxy as the dev/sandbox fallback.
+///
+/// This is a thin enum over the concrete backends. `Noop` exists so tests
+/// and dev runs do not need real credentials. In production the per-request
+/// `EdrCredentials` take precedence and this is never reached.
 #[derive(Clone)]
 pub enum EdrClient {
     /// Logs the intent and returns Ok. Used for dev, CI, and tests.
     Noop,
 
-    /// CrowdStrike Falcon Real Time Response.
+    /// CrowdStrike Falcon Real Time Response, configured from the global env.
     Crowdstrike(Arc<CrowdstrikeClient>),
 }
 
@@ -108,8 +184,9 @@ impl EdrClient {
     /// Build an `EdrClient` from environment variables.
     ///
     /// See module-level docs for the env-var contract. Defaults to
-    /// `Noop` if no provider is configured — this is safe-by-default
-    /// (mirrors `DRY_RUN=true` as a default).
+    /// `Noop` if no provider is configured, which is safe-by-default
+    /// (mirrors `DRY_RUN=true` as a default). This is the dev/sandbox
+    /// fallback only; production routes per-tenant credentials instead.
     pub fn from_env() -> Self {
         let provider = env::var("EDR_PROVIDER").unwrap_or_else(|_| "noop".to_string());
         match provider.trim().to_ascii_lowercase().as_str() {
@@ -118,31 +195,114 @@ impl EdrClient {
                 EdrClient::Noop
             }
             "crowdstrike" => {
-                let client = CrowdstrikeClient::from_env().expect(
-                    "CROWDSTRIKE_CLIENT_ID/SECRET must be set when EDR_PROVIDER=crowdstrike",
-                );
-                info!("EDR provider: crowdstrike");
+                let base_url = env::var("CROWDSTRIKE_BASE_URL")
+                    .unwrap_or_else(|_| "https://api.crowdstrike.com".to_string());
+                let client_id = env::var("CROWDSTRIKE_CLIENT_ID")
+                    .expect("CROWDSTRIKE_CLIENT_ID must be set when EDR_PROVIDER=crowdstrike");
+                let client_secret = env::var("CROWDSTRIKE_CLIENT_SECRET")
+                    .expect("CROWDSTRIKE_CLIENT_SECRET must be set when EDR_PROVIDER=crowdstrike");
+                let client = CrowdstrikeClient::new(base_url, client_id, client_secret)
+                    .expect("failed to build CrowdStrike HTTP client");
+                info!("EDR provider: crowdstrike (global env fallback)");
                 EdrClient::Crowdstrike(Arc::new(client))
             }
             other => panic!("unknown EDR_PROVIDER: {other}. Use 'noop' or 'crowdstrike'."),
         }
     }
 
-    /// Dispatch a containment action to the configured EDR.
-    pub async fn dispatch(&self, action: ActionType, host: &str) -> Result<(), EdrError> {
+    /// Dispatch using the global fallback client.
+    ///
+    /// Only reached when the request carried no usable per-tenant credentials
+    /// (dev/sandbox). `direction` selects contain vs lift.
+    async fn dispatch_fallback(
+        &self,
+        action: ActionType,
+        direction: ActionDirection,
+        host: &str,
+    ) -> Result<(), EdrError> {
         match self {
             EdrClient::Noop => {
-                info!(?action, host, "noop EDR: would dispatch");
+                info!(?action, ?direction, host, "noop EDR: would dispatch");
                 Ok(())
             }
-            EdrClient::Crowdstrike(client) => client.dispatch(action, host).await,
+            EdrClient::Crowdstrike(client) => client.dispatch(action, direction, host).await,
         }
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────
+/// Read the per-call HTTP timeout from the env, defaulting to 30s.
+fn http_timeout_secs() -> u64 {
+    env::var("EDR_HTTP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+}
+
+/// Dispatch a containment or rollback action, preferring per-tenant
+/// credentials over the global env fallback.
+///
+/// This is the single entry point the request handler calls. The decision
+/// tree:
+///
+/// 1. If the request carried usable `EdrCredentials`, build a one-shot
+///    client for that tenant's EDR and dispatch with it. Tenant A's action
+///    therefore always acts with tenant A's key, never the global env, never
+///    another tenant's key (CONSOLE_PLATFORM 8b consequence #4).
+/// 2. If no usable credentials were supplied, fall back to the global env
+///    client. In production that is `noop` (no-op) or absent; in dev it lets
+///    a single global CrowdStrike cred drive a sandbox.
+///
+/// `direction` selects whether we apply or reverse the action (contain vs
+/// lift / un-isolate), so the same dispatch path serves `/execute` and
+/// `/rollback`.
+pub async fn dispatch(
+    fallback: &EdrClient,
+    creds: Option<&EdrCredentials>,
+    action: ActionType,
+    direction: ActionDirection,
+    host: &str,
+) -> Result<(), EdrError> {
+    match creds {
+        Some(c) if c.is_usable() => match c.provider {
+            EdrProvider::Crowdstrike => {
+                let base_url = c
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.crowdstrike.com".to_string());
+                // is_usable guarantees both halves are present for CrowdStrike.
+                let secret = c.api_secret.clone().unwrap_or_default();
+                let client = CrowdstrikeClient::new(base_url, c.api_key.clone(), secret)?;
+                client.dispatch(action, direction, host).await
+            }
+            EdrProvider::Sentinelone => {
+                let base_url = c.base_url.clone().ok_or_else(|| {
+                    EdrError::Misconfigured(
+                        "SentinelOne credential is missing its base_url \
+                             (the management console URL)"
+                            .to_string(),
+                    )
+                })?;
+                let token = c.api_secret.clone().unwrap_or_default();
+                let client = SentinelOneClient::new(base_url, token)?;
+                client.dispatch(action, direction, host).await
+            }
+        },
+        // No usable per-tenant credential: dev/sandbox fallback.
+        _ => {
+            info!(
+                host,
+                ?action,
+                ?direction,
+                "no per-tenant EDR credential on request; using global env fallback"
+            );
+            fallback.dispatch_fallback(action, direction, host).await
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
 //  CrowdStrike Falcon implementation
-// ─────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------
 
 /// CrowdStrike Falcon Real Time Response client.
 ///
@@ -190,28 +350,22 @@ struct DeviceActionParam<'a> {
 }
 
 impl CrowdstrikeClient {
-    /// Build the client from environment variables. Returns `None` only
-    /// when required vars are missing (so `from_env` can panic with a
-    /// clear message rather than constructing a half-configured client).
-    fn from_env() -> Option<Self> {
-        let client_id = env::var("CROWDSTRIKE_CLIENT_ID").ok()?;
-        let client_secret = env::var("CROWDSTRIKE_CLIENT_SECRET").ok()?;
-        let base_url = env::var("CROWDSTRIKE_BASE_URL")
-            .unwrap_or_else(|_| "https://api.crowdstrike.com".to_string());
-        let timeout_secs: u64 = env::var("EDR_HTTP_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30);
-
+    /// Build a client for a given base URL and credential pair.
+    ///
+    /// Used both by `from_env` (global fallback) and by `dispatch` for a
+    /// per-tenant credential. Returns `Misconfigured` only if the HTTP
+    /// client itself cannot be built, which is effectively unreachable but
+    /// surfaced rather than `expect`-ed so it cannot DoS a request handler.
+    fn new(base_url: String, client_id: String, client_secret: String) -> Result<Self, EdrError> {
         let http = Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
+            .timeout(Duration::from_secs(http_timeout_secs()))
             // CrowdStrike requires a User-Agent. Identifying ourselves
             // honestly helps their support team correlate incidents.
             .user_agent(concat!("vyrox-proxy/", env!("CARGO_PKG_VERSION")))
             .build()
-            .ok()?;
+            .map_err(|e| EdrError::Misconfigured(format!("http client build failed: {e}")))?;
 
-        Some(Self {
+        Ok(Self {
             http,
             base_url,
             client_id,
@@ -223,9 +377,10 @@ impl CrowdstrikeClient {
     /// Get a bearer token, refreshing if necessary.
     ///
     /// Concurrency: only one task can hold the lock at a time, so
-    /// concurrent first-callers will serialize on the token fetch. After
-    /// the first fetch, all callers within the cache window get the
-    /// cached value without re-fetching.
+    /// concurrent first-callers serialize on the token fetch. After the
+    /// first fetch, all callers within the cache window get the cached value
+    /// without re-fetching. A per-request client (the per-tenant path) lives
+    /// for one action, so it fetches once and is dropped.
     async fn bearer_token(&self) -> Result<String, EdrError> {
         let mut guard = self.token.lock().await;
 
@@ -263,7 +418,7 @@ impl CrowdstrikeClient {
             .map_err(|e| EdrError::UnexpectedResponse(e.to_string()))?;
 
         // Refresh at 80% of expiry to absorb clock skew between us and
-        // CrowdStrike, and to avoid the cliff where token expires
+        // CrowdStrike, and to avoid the cliff where the token expires
         // mid-flight.
         let lifetime = Duration::from_secs((parsed.expires_in * 8) / 10);
         let new = CachedToken {
@@ -277,35 +432,16 @@ impl CrowdstrikeClient {
 
     /// Dispatch a single action to a single host.
     ///
-    /// We do not batch — pilot-scale traffic is human-approved, one at
-    /// a time. Batching would be a future optimization for bulk
-    /// containment use cases (SaaS, not pilot).
-    async fn dispatch(&self, action: ActionType, host: &str) -> Result<(), EdrError> {
-        // Translate our internal ActionType into the CrowdStrike action
-        // name expected on the query string. The mapping is documented
-        // in CrowdStrike's "Hosts" API reference.
-        let action_name = match action {
-            ActionType::HostIsolation => "contain",
-            ActionType::ProcessKill => {
-                // Process-kill is RTR-script territory, not a single
-                // host action. v0.1-alpha exposes it but maps it to
-                // host containment as a conservative fallback. We log
-                // explicitly so this is not silent.
-                warn!(
-                    host,
-                    "PROCESS_KILL requested; v0.1-alpha falls back to HOST_ISOLATION (RTR scripting is post-pilot)"
-                );
-                "contain"
-            }
-            ActionType::NetworkQuarantine => {
-                // CrowdStrike's terminology for network isolation is
-                // "contain", same as HostIsolation. There is a separate
-                // "network_contain" via firewall rules but it requires
-                // additional licensing; we treat them as equivalent for
-                // v0.1-alpha.
-                "contain"
-            }
-        };
+    /// `direction` chooses the CrowdStrike action name: contain vs lift.
+    /// We do not batch, pilot-scale traffic is human-approved, one at a
+    /// time.
+    async fn dispatch(
+        &self,
+        action: ActionType,
+        direction: ActionDirection,
+        host: &str,
+    ) -> Result<(), EdrError> {
+        let action_name = crowdstrike_action_name(action, direction, host);
 
         let token = self.bearer_token().await?;
 
@@ -330,7 +466,12 @@ impl CrowdstrikeClient {
 
         let status = resp.status();
         if status.is_success() {
-            info!(host, action = action_name, "edr action dispatched");
+            info!(
+                host,
+                action = action_name,
+                ?direction,
+                "edr action dispatched"
+            );
             return Ok(());
         }
 
@@ -353,24 +494,261 @@ impl CrowdstrikeClient {
     }
 }
 
+/// Map our internal `(ActionType, ActionDirection)` to the CrowdStrike
+/// action name on the query string.
+///
+/// Apply = "contain", Reverse = "lift_containment". The mapping is
+/// documented in CrowdStrike's "Hosts" API reference. PROCESS_KILL falls
+/// back to host containment for v0.1-alpha (RTR scripting is post-pilot);
+/// we log that explicitly so it is never silent.
+fn crowdstrike_action_name(
+    action: ActionType,
+    direction: ActionDirection,
+    host: &str,
+) -> &'static str {
+    if action == ActionType::ProcessKill {
+        warn!(
+            host,
+            ?direction,
+            "PROCESS_KILL maps to HOST_ISOLATION for v0.1-alpha (RTR scripting is post-pilot)"
+        );
+    }
+    match direction {
+        ActionDirection::Apply => "contain",
+        ActionDirection::Reverse => "lift_containment",
+    }
+}
+
+// ----------------------------------------------------------------------
+//  SentinelOne implementation
+// ----------------------------------------------------------------------
+
+/// SentinelOne client. Uses a static `ApiToken` in the Authorization header
+/// and the agents connect/disconnect actions for network containment.
+pub struct SentinelOneClient {
+    http: Client,
+    base_url: String,
+    token: String,
+}
+
+/// SentinelOne action bodies target agents by a filter. We target a single
+/// agent by its uuid (the `host` value the orchestrator supplies for an S1
+/// tenant is the agent uuid, mirroring how CrowdStrike uses the AID).
+#[derive(Serialize)]
+struct S1ActionBody<'a> {
+    filter: S1Filter<'a>,
+}
+
+#[derive(Serialize)]
+struct S1Filter<'a> {
+    uuids: Vec<&'a str>,
+}
+
+impl SentinelOneClient {
+    fn new(base_url: String, token: String) -> Result<Self, EdrError> {
+        let http = Client::builder()
+            .timeout(Duration::from_secs(http_timeout_secs()))
+            .user_agent(concat!("vyrox-proxy/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|e| EdrError::Misconfigured(format!("http client build failed: {e}")))?;
+        Ok(Self {
+            http,
+            base_url,
+            token,
+        })
+    }
+
+    async fn dispatch(
+        &self,
+        _action: ActionType,
+        direction: ActionDirection,
+        host: &str,
+    ) -> Result<(), EdrError> {
+        // SentinelOne network containment: connect = network on (rollback),
+        // disconnect = network off (contain). The agents action endpoints
+        // are `/web/api/v2.1/agents/actions/{disconnect|connect}`.
+        let action_path = match direction {
+            ActionDirection::Apply => "disconnect",
+            ActionDirection::Reverse => "connect",
+        };
+        let url = format!(
+            "{}/web/api/v2.1/agents/actions/{}",
+            self.base_url.trim_end_matches('/'),
+            action_path
+        );
+
+        let body = S1ActionBody {
+            filter: S1Filter { uuids: vec![host] },
+        };
+
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("ApiToken {}", self.token))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| EdrError::Transport(e.to_string()))?;
+
+        let status = resp.status();
+        if status.is_success() {
+            info!(
+                host,
+                action = action_path,
+                ?direction,
+                "s1 action dispatched"
+            );
+            return Ok(());
+        }
+
+        let body_text = resp.text().await.unwrap_or_default();
+        let snippet: String = body_text.chars().take(512).collect();
+        if status.is_client_error() {
+            Err(EdrError::ClientError {
+                status: status.as_u16(),
+                body: snippet,
+            })
+        } else {
+            Err(EdrError::ServerError {
+                status: status.as_u16(),
+                body: snippet,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn cs_creds() -> EdrCredentials {
+        EdrCredentials {
+            provider: EdrProvider::Crowdstrike,
+            api_key: "client-id".to_string(),
+            api_secret: Some("client-secret".to_string()),
+            base_url: Some("http://127.0.0.1:1".to_string()),
+        }
+    }
+
     #[tokio::test]
-    async fn noop_client_succeeds_for_all_actions() {
-        let client = EdrClient::Noop;
-        assert!(client
-            .dispatch(ActionType::HostIsolation, "h-1")
-            .await
-            .is_ok());
-        assert!(client
-            .dispatch(ActionType::ProcessKill, "h-1")
-            .await
-            .is_ok());
-        assert!(client
-            .dispatch(ActionType::NetworkQuarantine, "h-1")
-            .await
-            .is_ok());
+    async fn noop_fallback_succeeds_for_all_actions_both_directions() {
+        let fallback = EdrClient::Noop;
+        for action in [
+            ActionType::HostIsolation,
+            ActionType::ProcessKill,
+            ActionType::NetworkQuarantine,
+        ] {
+            for dir in [ActionDirection::Apply, ActionDirection::Reverse] {
+                assert!(
+                    dispatch(&fallback, None, action, dir, "h-1").await.is_ok(),
+                    "noop fallback should accept {action:?} {dir:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn crowdstrike_action_name_maps_direction() {
+        assert_eq!(
+            crowdstrike_action_name(ActionType::HostIsolation, ActionDirection::Apply, "h"),
+            "contain"
+        );
+        assert_eq!(
+            crowdstrike_action_name(ActionType::HostIsolation, ActionDirection::Reverse, "h"),
+            "lift_containment"
+        );
+    }
+
+    #[test]
+    fn credentials_usability_respects_provider_shape() {
+        assert!(cs_creds().is_usable());
+
+        // CrowdStrike needs both halves.
+        let mut missing_secret = cs_creds();
+        missing_secret.api_secret = None;
+        assert!(!missing_secret.is_usable());
+
+        let mut blank_key = cs_creds();
+        blank_key.api_key = "  ".to_string();
+        assert!(!blank_key.is_usable());
+
+        // SentinelOne is token-only: the token lives in api_secret.
+        let s1 = EdrCredentials {
+            provider: EdrProvider::Sentinelone,
+            api_key: String::new(),
+            api_secret: Some("tok".to_string()),
+            base_url: Some("https://s1.example".to_string()),
+        };
+        assert!(s1.is_usable());
+
+        let s1_blank = EdrCredentials {
+            provider: EdrProvider::Sentinelone,
+            api_key: String::new(),
+            api_secret: Some("   ".to_string()),
+            base_url: Some("https://s1.example".to_string()),
+        };
+        assert!(!s1_blank.is_usable());
+    }
+
+    #[tokio::test]
+    async fn per_tenant_credential_is_used_over_global_fallback() {
+        // The fallback is Noop (would succeed). The per-tenant credential
+        // points CrowdStrike at an unreachable base_url, so a transport
+        // error proves the per-tenant client ran INSTEAD of the noop
+        // fallback. If the fallback had been used we would get Ok.
+        let fallback = EdrClient::Noop;
+        let creds = cs_creds();
+        let err = dispatch(
+            &fallback,
+            Some(&creds),
+            ActionType::HostIsolation,
+            ActionDirection::Apply,
+            "device-1",
+        )
+        .await
+        .expect_err("per-tenant CrowdStrike client should attempt a real call and fail transport");
+        assert!(
+            matches!(err, EdrError::Transport(_)),
+            "expected transport error from per-tenant client, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unusable_credential_falls_back_to_global() {
+        // A credential whose secret is blank is NOT usable, so dispatch must
+        // fall back to the Noop global client and succeed.
+        let fallback = EdrClient::Noop;
+        let mut creds = cs_creds();
+        creds.api_secret = Some(String::new());
+        assert!(dispatch(
+            &fallback,
+            Some(&creds),
+            ActionType::HostIsolation,
+            ActionDirection::Apply,
+            "device-1",
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn sentinelone_without_base_url_is_misconfigured() {
+        let fallback = EdrClient::Noop;
+        let creds = EdrCredentials {
+            provider: EdrProvider::Sentinelone,
+            api_key: String::new(),
+            api_secret: Some("tok".to_string()),
+            base_url: None,
+        };
+        let err = dispatch(
+            &fallback,
+            Some(&creds),
+            ActionType::NetworkQuarantine,
+            ActionDirection::Apply,
+            "agent-1",
+        )
+        .await
+        .expect_err("S1 with no base_url must be Misconfigured");
+        assert!(matches!(err, EdrError::Misconfigured(_)));
     }
 }

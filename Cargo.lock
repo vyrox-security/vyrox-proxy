@@ -1649,6 +1649,7 @@ dependencies = [
  "dashmap",
  "hex",
  "hmac",
+ "http-body-util",
  "reqwest",
  "serde",
  "serde_json",
@@ -1657,6 +1658,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

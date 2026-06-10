@@ -33,7 +33,13 @@
 //! |--------|------------------|--------------------------------------|
 //! | GET    | /health          | Liveness probe                       |
 //! | POST   | /execute         | Execute a containment action         |
+//! | POST   | /rollback        | Reverse a containment action         |
 //! | GET    | /audit/export    | Tenant-scoped audit log export       |
+//!
+//! `/execute` and `/rollback` share one lifecycle (`run_action`): the only
+//! difference is the `ActionDirection` (apply vs reverse) and the audit
+//! `action_type` tag. Both verify HMAC, enforce the replay window, dedupe by
+//! nonce, audit BEFORE acting, and honour DRY_RUN identically.
 
 use std::env;
 use std::sync::{Arc, Mutex};
@@ -163,15 +169,28 @@ struct ExecuteRequest {
     /// `int(time.time())` at button-press time.
     #[serde(rename = "approved_at")]
     approved_at: i64,
+
+    /// Per-tenant EDR credentials, decrypted by the Python orchestrator and
+    /// carried inside this signed body (E7). When present and usable the
+    /// proxy acts in THIS tenant's EDR with THESE credentials, never the
+    /// global env. When absent the proxy falls back to its global env client
+    /// (dev/sandbox only). Optional so the dev/CI path needs no credentials.
+    ///
+    /// Safe to carry here because the whole body is HMAC-signed (a tampered
+    /// credential blob fails verification before it is read) and TLS encrypts
+    /// it in transit. Never logged.
+    #[serde(default)]
+    edr_credentials: Option<edr::EdrCredentials>,
 }
 
-/// Response payload for `POST /execute`.
+/// Response payload for `POST /execute` and `POST /rollback`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ExecuteResponse {
     /// Human-readable status. One of:
-    ///   - "executed" — EDR returned success.
+    ///   - "executed" — EDR applied the action successfully.
+    ///   - "rolled_back" — EDR reversed the action successfully.
     ///   - "dry_run" — DRY_RUN was set; EDR was not called.
-    ///   - "replayed" — request was previously executed; cached result returned.
+    ///   - "replayed" — request was previously processed; cached result returned.
     status: String,
 
     /// Whether DRY_RUN was active when this response was generated.
@@ -211,16 +230,46 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
 }
 
-/// `POST /execute` — the security-critical entry point.
+/// `POST /execute` — apply a containment action.
 ///
-/// See module-level docs for the full request lifecycle. The handler is
+/// Thin wrapper over `run_action` with `ActionDirection::Apply`. See
+/// `run_action` for the full step-numbered lifecycle.
+async fn execute(
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<ExecuteResponse>, StatusCode> {
+    run_action(state, headers, body, actions::ActionDirection::Apply).await
+}
+
+/// `POST /rollback` — reverse a containment action (un-isolate, restore
+/// network).
+///
+/// Identical security path to `/execute`: same HMAC verification, same
+/// replay window, same nonce dedup, same audit-before-act ordering, same
+/// DRY_RUN short-circuit. The only difference is `ActionDirection::Reverse`,
+/// which makes the EDR client call the inverse vendor action, and the audit
+/// `action_type` is prefixed `ROLLBACK_` so the trail names what was undone.
+async fn rollback(
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<ExecuteResponse>, StatusCode> {
+    run_action(state, headers, body, actions::ActionDirection::Reverse).await
+}
+
+/// Shared lifecycle for `/execute` and `/rollback` — the security-critical
+/// entry point.
+///
+/// See module-level docs for the request lifecycle. The handler is
 /// deliberately verbose and step-numbered to mirror the ordering the
 /// security review depends on; do not reorder steps without re-reading
 /// the threat model.
-async fn execute(
+async fn run_action(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
+    direction: actions::ActionDirection,
 ) -> Result<Json<ExecuteResponse>, StatusCode> {
     // ─ Step 1: Verify HMAC on the RAW bytes we received. ──────────────
     //
@@ -283,10 +332,15 @@ async fn execute(
     //
     // Even if the EDR call panics, crashes the process, or hangs, we
     // have a durable record of the intent on disk. The audit log is the
-    // ground truth, not the EDR's response.
+    // ground truth, not the EDR's response. The action_type is prefixed
+    // ROLLBACK_ on a reverse so the trail records what was undone.
+    let audit_action = match direction {
+        actions::ActionDirection::Apply => format!("{:?}", payload.action_type),
+        actions::ActionDirection::Reverse => format!("ROLLBACK_{:?}", payload.action_type),
+    };
     let entry = audit::build_entry(
         payload.tenant_id.clone(),
-        format!("{:?}", payload.action_type),
+        audit_action,
         payload.host.clone(),
         payload.approved_by.clone(),
         state.dry_run,
@@ -301,11 +355,19 @@ async fn execute(
     }
 
     // ─ Step 6: Execute (or skip in DRY_RUN). ──────────────────────────
+    //
+    // DRY_RUN short-circuits the EDR call for BOTH directions exactly the
+    // same way: no live call leaves the proxy in dev (Rule #5).
+    let success_status = match direction {
+        actions::ActionDirection::Apply => "executed",
+        actions::ActionDirection::Reverse => "rolled_back",
+    };
     let response = if state.dry_run {
         info!(
             request_id = %payload.request_id,
             tenant_id = %payload.tenant_id,
             action = ?payload.action_type,
+            ?direction,
             host = %payload.host,
             "DRY_RUN: skipping EDR call"
         );
@@ -314,18 +376,28 @@ async fn execute(
             dry_run: true,
         }
     } else {
-        // Real execution. The EDR client is responsible for its own
-        // retries, timeouts, and error mapping. We treat any error as
-        // a 502 Bad Gateway and release the nonce so a retry can try
-        // again on fresh state.
-        match state.edr.dispatch(payload.action_type, &payload.host).await {
+        // Real dispatch. The per-tenant credentials on the request take
+        // precedence over the global env fallback (E7). The EDR client
+        // owns its own retries, timeouts, and error mapping. Any error is
+        // a 502 Bad Gateway and we release the nonce so a retry runs on
+        // fresh state.
+        match edr::dispatch(
+            &state.edr,
+            payload.edr_credentials.as_ref(),
+            payload.action_type,
+            direction,
+            &payload.host,
+        )
+        .await
+        {
             Ok(()) => ExecuteResponse {
-                status: "executed".to_string(),
+                status: success_status.to_string(),
                 dry_run: false,
             },
             Err(err) => {
                 warn!(
                     request_id = %payload.request_id,
+                    ?direction,
                     error = %err,
                     "EDR dispatch failed; releasing nonce claim"
                 );
@@ -460,6 +532,21 @@ fn parse_bool_env(name: &str, default: bool) -> bool {
     }
 }
 
+/// Assemble the Axum router with the rate-limit layer over a given state.
+///
+/// Extracted from `main` so the full HTTP path (HMAC, replay, nonce, audit,
+/// DRY_RUN, dispatch) is exercisable in-process by the test suite via
+/// `tower::ServiceExt::oneshot`, with no real socket and no live EDR.
+fn build_router(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/execute", post(execute))
+        .route("/rollback", post(rollback))
+        .route("/audit/export", get(export_audit))
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
+        .with_state(state)
+}
+
 /// Application entry point.
 #[tokio::main]
 async fn main() {
@@ -497,12 +584,7 @@ async fn main() {
         rate: Arc::new(Mutex::new((Instant::now(), 0))),
     };
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/execute", post(execute))
-        .route("/audit/export", get(export_audit))
-        .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
-        .with_state(state);
+    let app = build_router(state);
 
     // Bind address is configurable so the container/host can override
     // it. Default :3000 keeps backward compatibility with existing
@@ -588,5 +670,220 @@ mod tests {
                                                      // A request more than a second later opens a fresh window.
         let later = start + Duration::from_secs(2);
         assert!(rate_check(&mut window, later, 1));
+    }
+
+    // ── HTTP-level lifecycle tests for /execute and /rollback ──────────
+    //
+    // These drive the assembled router in-process with `tower::oneshot`,
+    // so the whole path (HMAC, replay window, nonce, audit-before-act,
+    // DRY_RUN short-circuit, EDR dispatch) is exercised with no socket and
+    // no live EDR.
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    const TEST_SECRET: &str = "test-secret-32-bytes-long-padding!!";
+
+    /// Build a router with a known secret and a temp audit log. `dry_run`
+    /// toggles the EDR short-circuit; `edr` is the global fallback client.
+    fn test_router(dry_run: bool, edr: edr::EdrClient) -> (Router, TempDir) {
+        let dir = TempDir::new().expect("tempdir");
+        let audit_log_path = dir.path().join("audit.jsonl").to_str().unwrap().to_string();
+        let state = AppState {
+            hmac_secret: TEST_SECRET.to_string(),
+            audit_log_path,
+            dry_run,
+            nonces: nonce::NonceStore::new(),
+            edr,
+            audit_chain: audit::ChainState::genesis(),
+            rate: Arc::new(Mutex::new((Instant::now(), 0))),
+        };
+        (build_router(state), dir)
+    }
+
+    /// Sign a body the way the Python proxy_client does: HMAC-SHA256 hex
+    /// with the `sha256=` prefix.
+    fn sign_body(body: &[u8]) -> String {
+        // `::hmac` (the external crate) is fully qualified to disambiguate
+        // from the proxy's own `crate::hmac` module.
+        use ::hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut mac = Hmac::<Sha256>::new_from_slice(TEST_SECRET.as_bytes()).expect("mac");
+        mac.update(body);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    fn now_secs() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// Build a request body for `/execute` or `/rollback`. `creds` is the
+    /// optional per-tenant credential blob.
+    fn action_body(request_id: &str, creds: Option<serde_json::Value>) -> Vec<u8> {
+        let mut obj = json!({
+            "request_id": request_id,
+            "tenant_id": "tenant-a",
+            "alert_id": "alert-1",
+            "action_type": "HOST_ISOLATION",
+            "host": "device-1",
+            "approved_by": "analyst-jane",
+            "approved_at": now_secs(),
+        });
+        if let Some(c) = creds {
+            obj["edr_credentials"] = c;
+        }
+        serde_json::to_vec(&obj).expect("serialize")
+    }
+
+    async fn post(router: &Router, path: &str, body: Vec<u8>, sig: Option<String>) -> StatusCode {
+        let mut builder = Request::builder().method("POST").uri(path);
+        if let Some(s) = sig {
+            builder = builder.header("X-Vyrox-Signature", s);
+        }
+        let req = builder.body(Body::from(body)).expect("request");
+        router
+            .clone()
+            .oneshot(req)
+            .await
+            .expect("router response")
+            .status()
+    }
+
+    async fn post_json(
+        router: &Router,
+        path: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, serde_json::Value) {
+        let sig = sign_body(&body);
+        let req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("X-Vyrox-Signature", sig)
+            .body(Body::from(body))
+            .expect("request");
+        let resp = router.clone().oneshot(req).await.expect("router response");
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn execute_dry_run_short_circuits_and_audits() {
+        let (router, dir) = test_router(true, edr::EdrClient::Noop);
+        let body = action_body("req-exec-dry", None);
+        let (status, value) = post_json(&router, "/execute", body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["status"], "dry_run");
+        assert_eq!(value["dry_run"], true);
+        // Audit-before-act: the entry is on disk even though no EDR ran.
+        let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("audit log");
+        assert!(log.contains("HostIsolation"));
+    }
+
+    #[tokio::test]
+    async fn rollback_dry_run_short_circuits_and_audits_rollback_action() {
+        let (router, dir) = test_router(true, edr::EdrClient::Noop);
+        let body = action_body("req-rb-dry", None);
+        let (status, value) = post_json(&router, "/rollback", body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["status"], "dry_run");
+        assert_eq!(value["dry_run"], true);
+        // The audit entry names the rollback so the trail shows what was undone.
+        let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("audit log");
+        assert!(log.contains("ROLLBACK_HostIsolation"));
+    }
+
+    #[tokio::test]
+    async fn rollback_real_dispatch_succeeds_via_noop_fallback() {
+        // dry_run=false but the global fallback is Noop, so the rollback
+        // dispatch path runs to completion and reports rolled_back.
+        let (router, _dir) = test_router(false, edr::EdrClient::Noop);
+        let body = action_body("req-rb-live", None);
+        let (status, value) = post_json(&router, "/rollback", body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["status"], "rolled_back");
+        assert_eq!(value["dry_run"], false);
+    }
+
+    #[tokio::test]
+    async fn per_tenant_creds_used_over_global_env_fallback() {
+        // Global fallback is Noop (would succeed). The request carries a
+        // CrowdStrike credential pointed at an unreachable base_url, so a
+        // 502 proves the proxy used the PER-TENANT credential, not the
+        // global Noop fallback (which would have returned 200).
+        let (router, _dir) = test_router(false, edr::EdrClient::Noop);
+        let creds = json!({
+            "provider": "crowdstrike",
+            "api_key": "tenant-a-id",
+            "api_secret": "tenant-a-secret",
+            "base_url": "http://127.0.0.1:1",
+        });
+        let body = action_body("req-creds", Some(creds));
+        let status = {
+            let sig = sign_body(&body);
+            post(&router, "/execute", body, Some(sig)).await
+        };
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "per-tenant cred should be used and fail transport, not fall back to noop"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_signature_is_unauthorized() {
+        let (router, _dir) = test_router(true, edr::EdrClient::Noop);
+        let body = action_body("req-nosig", None);
+        let status = post(&router, "/execute", body, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn bad_signature_is_unauthorized_on_rollback() {
+        let (router, _dir) = test_router(true, edr::EdrClient::Noop);
+        let body = action_body("req-badsig", None);
+        let status = post(&router, "/rollback", body, Some("sha256=deadbeef".into())).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn stale_timestamp_is_rejected_by_replay_window() {
+        let (router, _dir) = test_router(true, edr::EdrClient::Noop);
+        // approved_at far in the past: outside the 30s replay window.
+        let mut obj = json!({
+            "request_id": "req-stale",
+            "tenant_id": "tenant-a",
+            "alert_id": "alert-1",
+            "action_type": "HOST_ISOLATION",
+            "host": "device-1",
+            "approved_by": "analyst-jane",
+            "approved_at": now_secs() - 3600,
+        });
+        obj["edr_credentials"] = serde_json::Value::Null;
+        let body = serde_json::to_vec(&obj).unwrap();
+        let sig = sign_body(&body);
+        let status = post(&router, "/rollback", body, Some(sig)).await;
+        assert_eq!(status, StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn duplicate_request_id_is_replayed_not_re_executed() {
+        let (router, _dir) = test_router(true, edr::EdrClient::Noop);
+        let body = action_body("req-dup", None);
+        let (s1, v1) = post_json(&router, "/execute", body.clone()).await;
+        assert_eq!(s1, StatusCode::OK);
+        assert_eq!(v1["status"], "dry_run");
+        // Same request_id again: cached replay, not a second execution.
+        let (s2, v2) = post_json(&router, "/execute", body).await;
+        assert_eq!(s2, StatusCode::OK);
+        assert_eq!(v2["status"], "replayed");
     }
 }
