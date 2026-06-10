@@ -886,4 +886,198 @@ mod tests {
         assert_eq!(s2, StatusCode::OK);
         assert_eq!(v2["status"], "replayed");
     }
+
+    // ── End-to-end: execute then rollback against a stateful mock EDR ──────
+    //
+    // The tests above short-circuit the EDR (DRY_RUN) or point a per-tenant
+    // credential at an unreachable address. This one proves the WHOLE loop:
+    // the proxy verifies the request, audits, and drives a REAL EDR call (over
+    // loopback HTTP) that isolates a host on /execute and un-isolates it on
+    // /rollback. A tiny stateful mock EDR implements the exact CrowdStrike
+    // contract the proxy speaks (the same shapes the Python mock_edr serves),
+    // so the assertion is end-to-end: host isolated, then un-isolated, both
+    // audited. No live CrowdStrike, no network beyond loopback. Hermetic.
+
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::Mutex as StdMutex;
+    use tokio::net::TcpListener;
+
+    /// Shared isolation state for the in-test mock EDR: host -> isolated?
+    type MockEdrState = Arc<StdMutex<HashMap<String, bool>>>;
+
+    /// Start a stateful CrowdStrike-shaped mock EDR on a loopback port.
+    ///
+    /// Implements the two endpoints the proxy's `CrowdstrikeClient` calls:
+    /// `POST /oauth2/token` (returns a bearer) and
+    /// `POST /devices/entities/devices-actions/v2?action_name=contain|lift_containment`
+    /// (flips the host's isolation bit and records it). Returns the base URL to
+    /// point a per-tenant credential at, and the shared state to assert on.
+    async fn spawn_mock_edr() -> (String, MockEdrState) {
+        let state: MockEdrState = Arc::new(StdMutex::new(HashMap::new()));
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(json!({
+                "access_token": "mock-bearer",
+                "token_type": "bearer",
+                "expires_in": 1800,
+            }))
+        }
+
+        async fn device_action(
+            State(state): State<MockEdrState>,
+            Query(params): Query<HashMap<String, String>>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> Result<Json<serde_json::Value>, StatusCode> {
+            // Presence-check the bearer so a proxy that forgot to authenticate
+            // is caught, exactly like the Python mock.
+            let authed = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.to_ascii_lowercase().starts_with("bearer "))
+                .unwrap_or(false);
+            if !authed {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            let action_name = params.get("action_name").cloned().unwrap_or_default();
+            let isolated = match action_name.as_str() {
+                "contain" => true,
+                "lift_containment" => false,
+                _ => return Err(StatusCode::BAD_REQUEST),
+            };
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+            let ids = parsed
+                .get("ids")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if ids.is_empty() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            {
+                let mut guard = state.lock().expect("mock edr state poisoned");
+                for id in &ids {
+                    if let Some(host) = id.as_str() {
+                        guard.insert(host.to_string(), isolated);
+                    }
+                }
+            }
+            Ok(Json(json!({ "resources": [], "errors": [] })))
+        }
+
+        // Fully-qualify the routing `post`: this test module has a local
+        // `post` helper (the request driver) that would otherwise shadow it.
+        let app = Router::new()
+            .route("/oauth2/token", axum::routing::post(token))
+            .route(
+                "/devices/entities/devices-actions/v2",
+                axum::routing::post(device_action),
+            )
+            .with_state(state.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock edr");
+        let addr: SocketAddr = listener.local_addr().expect("mock edr addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock edr serve");
+        });
+        (format!("http://{addr}"), state)
+    }
+
+    #[tokio::test]
+    async fn execute_then_rollback_isolates_then_unisolates_against_mock_edr() {
+        let (edr_base, edr_state) = spawn_mock_edr().await;
+        // Real dispatch (dry_run=false); the global fallback is Noop and must
+        // NOT be used because the per-tenant credential is present and usable.
+        let (router, dir) = test_router(false, edr::EdrClient::Noop);
+
+        let creds = json!({
+            "provider": "crowdstrike",
+            "api_key": "tenant-a-client-id",
+            "api_secret": "tenant-a-client-secret",
+            "base_url": edr_base,
+        });
+        let host = "device-1";
+
+        // 1) Execute -> the mock EDR should mark the host isolated.
+        let exec_body = action_body("e2e-exec", Some(creds.clone()));
+        let (exec_status, exec_value) = post_json(&router, "/execute", exec_body).await;
+        assert_eq!(exec_status, StatusCode::OK);
+        assert_eq!(exec_value["status"], "executed");
+        assert_eq!(exec_value["dry_run"], false);
+        assert_eq!(
+            edr_state.lock().unwrap().get(host).copied(),
+            Some(true),
+            "host should be isolated after /execute"
+        );
+
+        // 2) Rollback -> the mock EDR should mark the host un-isolated.
+        let rb_body = action_body("e2e-rb", Some(creds));
+        let (rb_status, rb_value) = post_json(&router, "/rollback", rb_body).await;
+        assert_eq!(rb_status, StatusCode::OK);
+        assert_eq!(rb_value["status"], "rolled_back");
+        assert_eq!(rb_value["dry_run"], false);
+        assert_eq!(
+            edr_state.lock().unwrap().get(host).copied(),
+            Some(false),
+            "host should be un-isolated after /rollback"
+        );
+
+        // 3) Both actions are audited: the execute names HostIsolation, the
+        //    rollback names ROLLBACK_HostIsolation.
+        let entries = audit::read_audit_logs(dir.path().join("audit.jsonl").to_str().unwrap())
+            .await
+            .expect("read audit log");
+        let actions: Vec<&str> = entries.iter().map(|e| e.action_type.as_str()).collect();
+        assert!(
+            actions.contains(&"HostIsolation"),
+            "execute must be audited, saw {actions:?}"
+        );
+        assert!(
+            actions.contains(&"ROLLBACK_HostIsolation"),
+            "rollback must be audited, saw {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_against_failing_edr_is_bad_gateway() {
+        // A mock EDR that always 500s on the action endpoint. The proxy must
+        // surface that as 502 BAD_GATEWAY (the Python side maps that to a
+        // paged ROLLBACK_FAILED), never a silent success.
+        let state: MockEdrState = Arc::new(StdMutex::new(HashMap::new()));
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(json!({"access_token": "t", "expires_in": 1800}))
+        }
+        async fn always_500() -> StatusCode {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        let app = Router::new()
+            .route("/oauth2/token", axum::routing::post(token))
+            .route(
+                "/devices/entities/devices-actions/v2",
+                axum::routing::post(always_500),
+            )
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr: SocketAddr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let (router, _dir) = test_router(false, edr::EdrClient::Noop);
+        let creds = json!({
+            "provider": "crowdstrike",
+            "api_key": "id",
+            "api_secret": "secret",
+            "base_url": format!("http://{addr}"),
+        });
+        let body = action_body("e2e-rb-fail", Some(creds));
+        let sig = sign_body(&body);
+        let status = post(&router, "/rollback", body, Some(sig)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
 }
