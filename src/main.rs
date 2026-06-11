@@ -504,7 +504,7 @@ async fn run_action(
     };
     let entry = audit::build_entry(
         payload.tenant_id.clone(),
-        audit_action,
+        audit_action.clone(),
         payload.host.clone(),
         payload.approved_by.clone(),
         state.dry_run,
@@ -542,9 +542,12 @@ async fn run_action(
     } else {
         // Real dispatch. The per-tenant credentials on the request take
         // precedence over the global env fallback (E7). The EDR client
-        // owns its own retries, timeouts, and error mapping. Any error is
-        // a 502 Bad Gateway and we release the nonce so a retry runs on
-        // fresh state.
+        // owns its own retries, timeouts, and error mapping. An action the
+        // provider cannot faithfully perform is 501 Not Implemented (never
+        // silently substituted with a different action); every other
+        // failure is 502 Bad Gateway. Either way we append a failure audit
+        // entry so the trail records that the intent did NOT happen, then
+        // release the nonce so a retry runs on fresh state.
         match edr::dispatch(
             &state.edr,
             payload.edr_credentials.as_ref(),
@@ -559,14 +562,41 @@ async fn run_action(
                 dry_run: false,
             },
             Err(err) => {
+                let status = match err {
+                    edr::EdrError::Unsupported { .. } => StatusCode::NOT_IMPLEMENTED,
+                    _ => StatusCode::BAD_GATEWAY,
+                };
                 warn!(
                     request_id = %payload.request_id,
                     ?direction,
                     error = %err,
-                    "EDR dispatch failed; releasing nonce claim"
+                    status = status.as_u16(),
+                    "EDR dispatch failed; auditing failure and releasing nonce claim"
                 );
+                // The step-5 entry recorded the INTENT. Without this
+                // companion entry the trail would read as if the action
+                // happened. Best-effort: the failure status is returned
+                // regardless, and a write error is logged, not swallowed
+                // into a fake success.
+                let failure_entry = audit::build_entry(
+                    payload.tenant_id.clone(),
+                    format!("FAILED_{audit_action}"),
+                    payload.host.clone(),
+                    payload.approved_by.clone(),
+                    state.dry_run,
+                );
+                if let Err(audit_err) =
+                    audit::append_audit(&state.audit_log_path, &state.audit_chain, failure_entry)
+                        .await
+                {
+                    warn!(
+                        request_id = %payload.request_id,
+                        error = %audit_err,
+                        "failed to write failure audit entry"
+                    );
+                }
                 release_nonce(&state.nonces, &payload.request_id).await;
-                return Err(StatusCode::BAD_GATEWAY);
+                return Err(status);
             }
         }
     };
@@ -1093,11 +1123,31 @@ mod tests {
         request_id: &str,
         creds: Option<serde_json::Value>,
     ) -> Vec<u8> {
+        action_body_full(tenant_id, request_id, "HOST_ISOLATION", creds)
+    }
+
+    /// As `action_body` but with an explicit action_type, for the
+    /// unsupported-action tests.
+    fn action_body_with_type(
+        action_type: &str,
+        request_id: &str,
+        creds: Option<serde_json::Value>,
+    ) -> Vec<u8> {
+        action_body_full("tenant-a", request_id, action_type, creds)
+    }
+
+    /// Fully parameterised request-body builder backing the helpers above.
+    fn action_body_full(
+        tenant_id: &str,
+        request_id: &str,
+        action_type: &str,
+        creds: Option<serde_json::Value>,
+    ) -> Vec<u8> {
         let mut obj = json!({
             "request_id": request_id,
             "tenant_id": tenant_id,
             "alert_id": "alert-1",
-            "action_type": "HOST_ISOLATION",
+            "action_type": action_type,
             "host": "device-1",
             "approved_by": "analyst-jane",
             "approved_at": now_secs(),
@@ -1203,6 +1253,101 @@ mod tests {
             StatusCode::BAD_GATEWAY,
             "per-tenant cred should be used and fail transport, not fall back to noop"
         );
+    }
+
+    #[tokio::test]
+    async fn process_kill_unsupported_returns_501_and_audits_failure() {
+        // The operator approves a PROCESS_KILL; CrowdStrike has no faithful
+        // mapping for it. The proxy must fail loudly (501, not a silent
+        // host quarantine) and the audit trail must record both the intent
+        // and the failure. The credential points at an unreachable address:
+        // 501 (not 502 Transport) proves no EDR call was even attempted.
+        let (router, dir) = test_router(false, edr::EdrClient::Noop);
+        let creds = json!({
+            "provider": "crowdstrike",
+            "api_key": "tenant-a-id",
+            "api_secret": "tenant-a-secret",
+            "base_url": "http://127.0.0.1:1",
+        });
+        let body = action_body_with_type("PROCESS_KILL", "req-kill-unsupported", Some(creds));
+        let (status, _) = post_json(&router, "/execute", body).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_IMPLEMENTED,
+            "unsupported action must be 501, never silently substituted"
+        );
+
+        let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("audit log");
+        assert!(
+            log.contains("\"ProcessKill\""),
+            "intent entry must be audited"
+        );
+        assert!(
+            log.contains("\"FAILED_ProcessKill\""),
+            "failure entry must be audited so the trail does not read as executed"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_kill_unsupported_on_sentinelone_returns_501() {
+        let (router, _dir) = test_router(false, edr::EdrClient::Noop);
+        let creds = json!({
+            "provider": "sentinelone",
+            "api_key": "",
+            "api_secret": "tenant-b-token",
+            "base_url": "http://127.0.0.1:1",
+        });
+        let body = action_body_with_type("PROCESS_KILL", "req-kill-s1", Some(creds));
+        let sig = sign_body(&body);
+        let status = post(&router, "/execute", body, Some(sig)).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn process_kill_dry_run_short_circuits_before_any_edr_logic() {
+        // DRY_RUN must completely prevent EDR calls (Rule #5), including
+        // for actions the provider cannot perform: the short-circuit runs
+        // before dispatch, so even PROCESS_KILL reports dry_run rather than
+        // touching the EDR client. The unreachable credential proves no
+        // call could have succeeded silently.
+        let (router, dir) = test_router(true, edr::EdrClient::Noop);
+        let creds = json!({
+            "provider": "crowdstrike",
+            "api_key": "tenant-a-id",
+            "api_secret": "tenant-a-secret",
+            "base_url": "http://127.0.0.1:1",
+        });
+        let body = action_body_with_type("PROCESS_KILL", "req-kill-dry", Some(creds));
+        let (status, value) = post_json(&router, "/execute", body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["status"], "dry_run");
+        assert_eq!(value["dry_run"], true);
+        // The intent is still audited, marked dry_run, with no failure
+        // entry because nothing was attempted.
+        let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("audit log");
+        assert!(log.contains("\"ProcessKill\""));
+        assert!(!log.contains("FAILED_"));
+    }
+
+    #[tokio::test]
+    async fn failed_dispatch_audits_failure_entry() {
+        // A reachable-looking but dead EDR (transport failure) must leave a
+        // FAILED_ entry next to the intent entry, so an auditor reading the
+        // trail can tell intent from outcome.
+        let (router, dir) = test_router(false, edr::EdrClient::Noop);
+        let creds = json!({
+            "provider": "crowdstrike",
+            "api_key": "tenant-a-id",
+            "api_secret": "tenant-a-secret",
+            "base_url": "http://127.0.0.1:1",
+        });
+        let body = action_body("req-iso-fail", Some(creds));
+        let sig = sign_body(&body);
+        let status = post(&router, "/execute", body, Some(sig)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("audit log");
+        assert!(log.contains("\"HostIsolation\""));
+        assert!(log.contains("\"FAILED_HostIsolation\""));
     }
 
     #[tokio::test]
