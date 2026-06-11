@@ -520,84 +520,100 @@ async fn run_action(
 
     // ─ Step 6: Execute (or skip in DRY_RUN). ──────────────────────────
     //
-    // DRY_RUN short-circuits the EDR call for BOTH directions exactly the
-    // same way: no live call leaves the proxy in dev (Rule #5).
+    // The supportability check runs BEFORE the DRY_RUN short-circuit, on
+    // purpose: a dry-run rehearsal of an action the provider cannot
+    // faithfully perform (e.g. PROCESS_KILL on CrowdStrike) must predict
+    // the production 501, not report dry-run success. The check is pure
+    // (action-name mappers only, no client, no network), so Rule #5 holds:
+    // DRY_RUN still short-circuits the EDR call for BOTH directions and no
+    // live call leaves the proxy in dev.
     let success_status = match direction {
         actions::ActionDirection::Apply => "executed",
         actions::ActionDirection::Reverse => "rolled_back",
     };
-    let response = if state.dry_run {
-        info!(
-            request_id = %payload.request_id,
-            tenant_id = %payload.tenant_id,
-            action = ?payload.action_type,
-            ?direction,
-            host = %payload.host,
-            "DRY_RUN: skipping EDR call"
-        );
-        ExecuteResponse {
-            status: "dry_run".to_string(),
-            dry_run: true,
+    let supported = edr::check_supported(
+        &state.edr,
+        payload.edr_credentials.as_ref(),
+        payload.action_type,
+        direction,
+    );
+    let outcome: Result<ExecuteResponse, edr::EdrError> = match supported {
+        Err(err) => Err(err),
+        Ok(()) if state.dry_run => {
+            info!(
+                request_id = %payload.request_id,
+                tenant_id = %payload.tenant_id,
+                action = ?payload.action_type,
+                ?direction,
+                host = %payload.host,
+                "DRY_RUN: skipping EDR call"
+            );
+            Ok(ExecuteResponse {
+                status: "dry_run".to_string(),
+                dry_run: true,
+            })
         }
-    } else {
-        // Real dispatch. The per-tenant credentials on the request take
-        // precedence over the global env fallback (E7). The EDR client
-        // owns its own retries, timeouts, and error mapping. An action the
-        // provider cannot faithfully perform is 501 Not Implemented (never
-        // silently substituted with a different action); every other
-        // failure is 502 Bad Gateway. Either way we append a failure audit
-        // entry so the trail records that the intent did NOT happen, then
-        // release the nonce so a retry runs on fresh state.
-        match edr::dispatch(
-            &state.edr,
-            payload.edr_credentials.as_ref(),
-            payload.action_type,
-            direction,
-            &payload.host,
-        )
-        .await
-        {
-            Ok(()) => ExecuteResponse {
+        Ok(()) => {
+            // Real dispatch. The per-tenant credentials on the request take
+            // precedence over the global env fallback (E7). The EDR client
+            // owns its own retries, timeouts, and error mapping.
+            edr::dispatch(
+                &state.edr,
+                payload.edr_credentials.as_ref(),
+                payload.action_type,
+                direction,
+                &payload.host,
+            )
+            .await
+            .map(|()| ExecuteResponse {
                 status: success_status.to_string(),
                 dry_run: false,
-            },
-            Err(err) => {
-                let status = match err {
-                    edr::EdrError::Unsupported { .. } => StatusCode::NOT_IMPLEMENTED,
-                    _ => StatusCode::BAD_GATEWAY,
-                };
+            })
+        }
+    };
+    let response = match outcome {
+        Ok(response) => response,
+        // An action the provider cannot faithfully perform is 501 Not
+        // Implemented (never silently substituted with a different action),
+        // in dry-run and live alike; every other failure is 502 Bad
+        // Gateway. Either way we append a failure audit entry so the trail
+        // records that the intent did NOT happen, then release the nonce so
+        // a retry runs on fresh state.
+        Err(err) => {
+            let status = match err {
+                edr::EdrError::Unsupported { .. } => StatusCode::NOT_IMPLEMENTED,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            warn!(
+                request_id = %payload.request_id,
+                ?direction,
+                error = %err,
+                status = status.as_u16(),
+                "EDR action failed; auditing failure and releasing nonce claim"
+            );
+            // The step-5 entry recorded the INTENT. Without this
+            // companion entry the trail would read as if the action
+            // happened. Best-effort: the failure status is returned
+            // regardless, and a write error is logged, not swallowed
+            // into a fake success.
+            let failure_entry = audit::build_entry(
+                payload.tenant_id.clone(),
+                format!("FAILED_{audit_action}"),
+                payload.host.clone(),
+                payload.approved_by.clone(),
+                state.dry_run,
+            );
+            if let Err(audit_err) =
+                audit::append_audit(&state.audit_log_path, &state.audit_chain, failure_entry).await
+            {
                 warn!(
                     request_id = %payload.request_id,
-                    ?direction,
-                    error = %err,
-                    status = status.as_u16(),
-                    "EDR dispatch failed; auditing failure and releasing nonce claim"
+                    error = %audit_err,
+                    "failed to write failure audit entry"
                 );
-                // The step-5 entry recorded the INTENT. Without this
-                // companion entry the trail would read as if the action
-                // happened. Best-effort: the failure status is returned
-                // regardless, and a write error is logged, not swallowed
-                // into a fake success.
-                let failure_entry = audit::build_entry(
-                    payload.tenant_id.clone(),
-                    format!("FAILED_{audit_action}"),
-                    payload.host.clone(),
-                    payload.approved_by.clone(),
-                    state.dry_run,
-                );
-                if let Err(audit_err) =
-                    audit::append_audit(&state.audit_log_path, &state.audit_chain, failure_entry)
-                        .await
-                {
-                    warn!(
-                        request_id = %payload.request_id,
-                        error = %audit_err,
-                        "failed to write failure audit entry"
-                    );
-                }
-                release_nonce(&state.nonces, &payload.request_id).await;
-                return Err(status);
             }
+            release_nonce(&state.nonces, &payload.request_id).await;
+            return Err(status);
         }
     };
 
@@ -1304,12 +1320,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_kill_dry_run_short_circuits_before_any_edr_logic() {
-        // DRY_RUN must completely prevent EDR calls (Rule #5), including
-        // for actions the provider cannot perform: the short-circuit runs
-        // before dispatch, so even PROCESS_KILL reports dry_run rather than
-        // touching the EDR client. The unreachable credential proves no
-        // call could have succeeded silently.
+    async fn process_kill_dry_run_predicts_production_501() {
+        // The supportability check runs BEFORE the dry-run short-circuit,
+        // so a rehearsal of an action the provider cannot perform returns
+        // the same 501 production would. The check is pure (action-name
+        // mappers only) and the credential points at an unreachable
+        // address: 501 (not 502 Transport) proves no EDR call was even
+        // attempted, so Rule #5 still holds.
         let (router, dir) = test_router(true, edr::EdrClient::Noop);
         let creds = json!({
             "provider": "crowdstrike",
@@ -1318,14 +1335,54 @@ mod tests {
             "base_url": "http://127.0.0.1:1",
         });
         let body = action_body_with_type("PROCESS_KILL", "req-kill-dry", Some(creds));
+        let (status, _) = post_json(&router, "/execute", body).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_IMPLEMENTED,
+            "dry-run must predict the production 501 for unsupported actions"
+        );
+        // The trail mirrors production too: intent entry plus a FAILED_
+        // companion so the rehearsal does not read as a success.
+        let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("audit log");
+        assert!(log.contains("\"ProcessKill\""));
+        assert!(log.contains("\"FAILED_ProcessKill\""));
+    }
+
+    #[tokio::test]
+    async fn process_kill_dry_run_on_sentinelone_returns_501() {
+        let (router, _dir) = test_router(true, edr::EdrClient::Noop);
+        let creds = json!({
+            "provider": "sentinelone",
+            "api_key": "",
+            "api_secret": "tenant-b-token",
+            "base_url": "http://127.0.0.1:1",
+        });
+        let body = action_body_with_type("PROCESS_KILL", "req-kill-dry-s1", Some(creds));
+        let sig = sign_body(&body);
+        let status = post(&router, "/execute", body, Some(sig)).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn host_isolation_dry_run_with_creds_still_short_circuits() {
+        // Supported actions are untouched by the reorder: dry-run still
+        // returns dry-run success with ZERO network calls. The credential
+        // points at an unreachable address, so anything other than
+        // dry_run success would mean a call left the proxy (Rule #5).
+        let (router, dir) = test_router(true, edr::EdrClient::Noop);
+        let creds = json!({
+            "provider": "crowdstrike",
+            "api_key": "tenant-a-id",
+            "api_secret": "tenant-a-secret",
+            "base_url": "http://127.0.0.1:1",
+        });
+        let body = action_body("req-iso-dry-creds", Some(creds));
         let (status, value) = post_json(&router, "/execute", body).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(value["status"], "dry_run");
         assert_eq!(value["dry_run"], true);
-        // The intent is still audited, marked dry_run, with no failure
-        // entry because nothing was attempted.
         let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("audit log");
-        assert!(log.contains("\"ProcessKill\""));
+        assert!(log.contains("\"HostIsolation\""));
         assert!(!log.contains("FAILED_"));
     }
 

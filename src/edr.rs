@@ -333,6 +333,38 @@ pub async fn dispatch(
     }
 }
 
+/// Pure supportability check: would `dispatch` have a faithful mapping for
+/// this action on the provider this request would target?
+///
+/// Mirrors `dispatch`'s provider selection (per-tenant credential first,
+/// global env fallback otherwise) but only consults the pure action-name
+/// mappers. It makes ZERO network calls and builds no HTTP client, so the
+/// request handler can run it BEFORE the DRY_RUN short-circuit without
+/// violating Rule #5. That ordering is the point: a dry-run rehearsal of an
+/// action the provider cannot perform must predict the production 501, not
+/// report dry-run success.
+///
+/// `Noop` supports everything by construction: it performs nothing, so there
+/// is no mapping to be unfaithful to.
+pub fn check_supported(
+    fallback: &EdrClient,
+    creds: Option<&EdrCredentials>,
+    action: ActionType,
+    direction: ActionDirection,
+) -> Result<(), EdrError> {
+    let provider = match creds {
+        Some(c) if c.is_usable() => c.provider,
+        _ => match fallback {
+            EdrClient::Noop => return Ok(()),
+            EdrClient::Crowdstrike(_) => EdrProvider::Crowdstrike,
+        },
+    };
+    match provider {
+        EdrProvider::Crowdstrike => crowdstrike_action_name(action, direction).map(|_| ()),
+        EdrProvider::Sentinelone => sentinelone_action_path(action, direction).map(|_| ()),
+    }
+}
+
 // ----------------------------------------------------------------------
 //  CrowdStrike Falcon implementation
 // ----------------------------------------------------------------------
@@ -718,6 +750,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn check_supported_mirrors_dispatch_provider_selection() {
+        // Per-tenant CrowdStrike credential: PROCESS_KILL is unsupported,
+        // containment actions pass. No client is built, no call leaves.
+        let creds = cs_creds();
+        for dir in [ActionDirection::Apply, ActionDirection::Reverse] {
+            let err = check_supported(&EdrClient::Noop, Some(&creds), ActionType::ProcessKill, dir)
+                .expect_err("PROCESS_KILL has no faithful CrowdStrike mapping");
+            assert!(matches!(err, EdrError::Unsupported { .. }));
+            check_supported(
+                &EdrClient::Noop,
+                Some(&creds),
+                ActionType::HostIsolation,
+                dir,
+            )
+            .expect("host isolation is supported");
+        }
+    }
+
+    #[test]
+    fn check_supported_treats_noop_fallback_as_supporting_everything() {
+        // No usable credential and a Noop fallback: nothing real would run,
+        // so nothing is unsupported. Mirrors dispatch, which returns Ok.
+        for action in [
+            ActionType::HostIsolation,
+            ActionType::ProcessKill,
+            ActionType::NetworkQuarantine,
+        ] {
+            check_supported(&EdrClient::Noop, None, action, ActionDirection::Apply)
+                .expect("noop fallback supports every action");
+        }
+    }
+
+    #[test]
+    fn check_supported_unusable_credential_falls_back() {
+        // A blank credential is "not configured": supportability follows the
+        // fallback (Noop here), exactly like dispatch's routing.
+        let creds = EdrCredentials {
+            provider: EdrProvider::Crowdstrike,
+            api_key: "  ".to_string(),
+            api_secret: None,
+            base_url: None,
+        };
+        check_supported(
+            &EdrClient::Noop,
+            Some(&creds),
+            ActionType::ProcessKill,
+            ActionDirection::Apply,
+        )
+        .expect("unusable credential routes to the Noop fallback");
     }
 
     #[test]
