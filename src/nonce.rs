@@ -128,6 +128,17 @@ fn retention_seconds() -> u64 {
         .unwrap_or(DEFAULT_RETENTION_SECONDS)
 }
 
+/// True when a Redis URL is configured (`NONCE_REDIS_URL` or `REDIS_URL`).
+///
+/// Lets `main` decide BEFORE building the store whether a missing URL should be
+/// a hard boot error (PRX-01). A configured-but-unreachable URL is handled by
+/// `from_env` (it hard-errors); this only distinguishes "URL present" from "no
+/// URL at all", which is the case that would otherwise silently fall back to
+/// the non-durable in-memory store.
+pub fn redis_url_configured() -> bool {
+    redis_url_from_env().is_some()
+}
+
 /// Resolve the Redis URL for the nonce store from the environment.
 ///
 /// `NONCE_REDIS_URL` wins over the shared `REDIS_URL`. A blank value is treated
@@ -678,7 +689,10 @@ mod tests {
             "first claim must be fresh"
         );
         store1
-            .record_response(&req, r#"{"status":"executed","dry_run":false}"#.to_string())
+            .record_response(
+                &req,
+                r#"{"status":"executed","simulated":false}"#.to_string(),
+            )
             .await
             .unwrap();
 
@@ -698,7 +712,7 @@ mod tests {
                 cached_response_json,
             } => {
                 assert_eq!(
-                    cached_response_json, r#"{"status":"executed","dry_run":false}"#,
+                    cached_response_json, r#"{"status":"executed","simulated":false}"#,
                     "cached response must survive the restart"
                 );
             }

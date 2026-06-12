@@ -217,9 +217,11 @@ impl EdrClient {
     /// Build an `EdrClient` from environment variables.
     ///
     /// See module-level docs for the env-var contract. Defaults to
-    /// `Noop` if no provider is configured, which is safe-by-default
-    /// (mirrors `DRY_RUN=true` as a default). This is the dev/sandbox
-    /// fallback only; production routes per-tenant credentials instead.
+    /// `Noop` if no provider is configured, which is safe-by-default: the
+    /// proxy always dispatches, and with no global credential the Noop
+    /// fallback performs nothing rather than calling a real EDR. This is the
+    /// dev/sandbox fallback only; production routes per-tenant credentials
+    /// instead.
     pub fn from_env() -> Self {
         let provider = env::var("EDR_PROVIDER").unwrap_or_else(|_| "noop".to_string());
         match provider.trim().to_ascii_lowercase().as_str() {
@@ -339,10 +341,10 @@ pub async fn dispatch(
 /// Mirrors `dispatch`'s provider selection (per-tenant credential first,
 /// global env fallback otherwise) but only consults the pure action-name
 /// mappers. It makes ZERO network calls and builds no HTTP client, so the
-/// request handler can run it BEFORE the DRY_RUN short-circuit without
-/// violating Rule #5. That ordering is the point: a dry-run rehearsal of an
-/// action the provider cannot perform must predict the production 501, not
-/// report dry-run success.
+/// request handler can run it BEFORE dispatching to fail an unsupported action
+/// loudly with a 501 instead of substituting a different action: the operator
+/// approved a specific containment, and the proxy refuses to do something
+/// broader.
 ///
 /// `Noop` supports everything by construction: it performs nothing, so there
 /// is no mapping to be unfaithful to.

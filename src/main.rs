@@ -24,7 +24,11 @@
 //! 6. **Audit before action** - write an audit entry recording the
 //!    intent BEFORE invoking the EDR (`audit::append_audit`). This way
 //!    a crash mid-action still leaves a forensic trail.
-//! 7. **Execute via the EDR client** (or return early if DRY_RUN).
+//! 7. **Execute via the configured EDR client.** The proxy ALWAYS dispatches
+//!    to the EDR (the global DRY_RUN kill-switch is gone). For a demo/mock
+//!    tenant the request carries `simulated=true` and the per-tenant
+//!    credential points the same real call at the bundled mock EDR, so the
+//!    execute/rollback path runs end to end against a simulated fleet.
 //! 8. **Cache the response** in the nonce store so retries are idempotent.
 //!
 //! ## Endpoints
@@ -39,7 +43,7 @@
 //! `/execute` and `/rollback` share one lifecycle (`run_action`): the only
 //! difference is the `ActionDirection` (apply vs reverse) and the audit
 //! `action_type` tag. Both verify HMAC, enforce the replay window, dedupe by
-//! nonce, audit BEFORE acting, and honour DRY_RUN identically.
+//! nonce, and audit BEFORE acting identically.
 
 use std::env;
 use std::sync::{Arc, Mutex};
@@ -107,11 +111,6 @@ struct AppState {
 
     /// Path to the append-only JSONL audit log.
     audit_log_path: String,
-
-    /// If true, action execution is skipped and the EDR is never called.
-    /// Default for development and CI. Production must set DRY_RUN=false
-    /// **explicitly** (see `main` - we err on the side of safe-by-default).
-    dry_run: bool,
 
     /// In-process dedup store keyed by `request_id`. See `nonce.rs`.
     nonces: nonce::NonceStore,
@@ -190,10 +189,18 @@ impl RateLimiter {
     /// Runs in the middleware before HMAC verification. Returns true if the
     /// request is allowed.
     fn check_global(&self, now: Instant) -> bool {
+        // PRX-03: recover from a poisoned lock instead of panicking. This mutex
+        // runs in the pre-HMAC middleware on EVERY request; a single panic
+        // while holding it would poison it and turn every subsequent /execute
+        // into a panic, a total DoS of containment. The guarded data is a
+        // plain (Instant, u32) fixed-window counter with no invariant a panic
+        // could have left half-updated, so taking the inner value on poison is
+        // safe: at worst one window's count is slightly off, which self-heals
+        // on the next one-second rollover.
         let mut window = self
             .global
             .lock()
-            .expect("global rate-limit mutex poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         rate_check(&mut window, now, self.global_limit)
     }
 
@@ -308,6 +315,22 @@ struct ExecuteRequest {
     /// it in transit. Never logged.
     #[serde(default)]
     edr_credentials: Option<edr::EdrCredentials>,
+
+    /// Honesty label: this action targets a demo/mock fleet, not a real
+    /// customer EDR. The Python side sets it from the tenant's `is_demo` flag
+    /// and signs it inside the body (tamper-evident, not a spoofable header).
+    ///
+    /// It does NOT change proxy behavior: the proxy still performs the real EDR
+    /// call. For a demo tenant the per-tenant credential points that real call
+    /// at the bundled mock EDR (vyrox/mock_edr), so the whole execute/rollback
+    /// path runs end to end against a simulated fleet. `simulated=true` records
+    /// in the audit + response that the action targeted a demo/mock fleet.
+    ///
+    /// `#[serde(default)]` keeps this backward-compatible: an older Python
+    /// caller that omits the field signs a body the proxy still accepts, and
+    /// the flag defaults to false (treated as a real fleet).
+    #[serde(default)]
+    simulated: bool,
 }
 
 /// Response payload for `POST /execute` and `POST /rollback`.
@@ -316,12 +339,14 @@ struct ExecuteResponse {
     /// Human-readable status. One of:
     ///   - "executed" - EDR applied the action successfully.
     ///   - "rolled_back" - EDR reversed the action successfully.
-    ///   - "dry_run" - DRY_RUN was set; EDR was not called.
     ///   - "replayed" - request was previously processed; cached result returned.
     status: String,
 
-    /// Whether DRY_RUN was active when this response was generated.
-    dry_run: bool,
+    /// Honesty label echoed back from the request: whether this action
+    /// targeted a demo/mock fleet. It does NOT mean the EDR call was skipped,
+    /// the call always runs; for a demo tenant it lands on the bundled mock
+    /// EDR. Mirrors the `simulated` field recorded in the audit entry.
+    simulated: bool,
 }
 
 /// Query parameters for the audit export endpoint.
@@ -373,10 +398,10 @@ async fn execute(
 /// network).
 ///
 /// Identical security path to `/execute`: same HMAC verification, same
-/// replay window, same nonce dedup, same audit-before-act ordering, same
-/// DRY_RUN short-circuit. The only difference is `ActionDirection::Reverse`,
-/// which makes the EDR client call the inverse vendor action, and the audit
-/// `action_type` is prefixed `ROLLBACK_` so the trail names what was undone.
+/// replay window, same nonce dedup, same audit-before-act ordering. The only
+/// difference is `ActionDirection::Reverse`, which makes the EDR client call
+/// the inverse vendor action, and the audit `action_type` is prefixed
+/// `ROLLBACK_` so the trail names what was undone.
 async fn rollback(
     state: State<AppState>,
     headers: HeaderMap,
@@ -483,7 +508,7 @@ async fn run_action(
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             return Ok(Json(ExecuteResponse {
                 status: "replayed".to_string(),
-                dry_run: cached.dry_run,
+                simulated: cached.simulated,
             }));
         }
         nonce::Outcome::InFlight => {
@@ -507,7 +532,7 @@ async fn run_action(
         audit_action.clone(),
         payload.host.clone(),
         payload.approved_by.clone(),
-        state.dry_run,
+        payload.simulated,
     );
     if let Err(err) = audit::append_audit(&state.audit_log_path, &state.audit_chain, entry).await {
         // Audit log failure is fatal - we don't proceed without a
@@ -518,15 +543,20 @@ async fn run_action(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // ─ Step 6: Execute (or skip in DRY_RUN). ──────────────────────────
+    // ─ Step 6: Execute. ───────────────────────────────────────────────
     //
-    // The supportability check runs BEFORE the DRY_RUN short-circuit, on
-    // purpose: a dry-run rehearsal of an action the provider cannot
-    // faithfully perform (e.g. PROCESS_KILL on CrowdStrike) must predict
-    // the production 501, not report dry-run success. The check is pure
-    // (action-name mappers only, no client, no network), so Rule #5 holds:
-    // DRY_RUN still short-circuits the EDR call for BOTH directions and no
-    // live call leaves the proxy in dev.
+    // The proxy ALWAYS dispatches to the configured EDR. The global DRY_RUN
+    // kill-switch is gone: there is no longer a path that audits an intent and
+    // then quietly declines to act on it. For a demo/mock tenant the request
+    // carries `simulated=true` and the per-tenant credential points this same
+    // real call at the bundled mock EDR, so the execute/rollback path runs end
+    // to end against a simulated fleet. `simulated` is an honesty label on the
+    // audit + response only; it never gates the call.
+    //
+    // The supportability check runs first, on purpose: an action the provider
+    // cannot faithfully perform (e.g. PROCESS_KILL on CrowdStrike) must fail
+    // loudly with a 501 before any network call, never be silently substituted.
+    // The check is pure (action-name mappers only, no client, no network).
     let success_status = match direction {
         actions::ActionDirection::Apply => "executed",
         actions::ActionDirection::Reverse => "rolled_back",
@@ -539,24 +569,11 @@ async fn run_action(
     );
     let outcome: Result<ExecuteResponse, edr::EdrError> = match supported {
         Err(err) => Err(err),
-        Ok(()) if state.dry_run => {
-            info!(
-                request_id = %payload.request_id,
-                tenant_id = %payload.tenant_id,
-                action = ?payload.action_type,
-                ?direction,
-                host = %payload.host,
-                "DRY_RUN: skipping EDR call"
-            );
-            Ok(ExecuteResponse {
-                status: "dry_run".to_string(),
-                dry_run: true,
-            })
-        }
         Ok(()) => {
             // Real dispatch. The per-tenant credentials on the request take
             // precedence over the global env fallback (E7). The EDR client
-            // owns its own retries, timeouts, and error mapping.
+            // owns its own retries, timeouts, and error mapping. We echo the
+            // request's `simulated` honesty label back unchanged.
             edr::dispatch(
                 &state.edr,
                 payload.edr_credentials.as_ref(),
@@ -567,7 +584,7 @@ async fn run_action(
             .await
             .map(|()| ExecuteResponse {
                 status: success_status.to_string(),
-                dry_run: false,
+                simulated: payload.simulated,
             })
         }
     };
@@ -601,7 +618,7 @@ async fn run_action(
                 format!("FAILED_{audit_action}"),
                 payload.host.clone(),
                 payload.approved_by.clone(),
-                state.dry_run,
+                payload.simulated,
             );
             if let Err(audit_err) =
                 audit::append_audit(&state.audit_log_path, &state.audit_chain, failure_entry).await
@@ -671,9 +688,12 @@ async fn run_action(
 ///
 /// ## Production notes
 ///
-/// This reads the entire log into memory on every call. Fine for
-/// pilot scale (10s of MB max); for SaaS we'll move to a streaming
-/// JSONL response and per-tenant log shards.
+/// The log is read by streaming it line-by-line and keeping only this tenant's
+/// entries (`audit::read_tenant_entries_streaming`, PRX-04), so the whole file
+/// is never resident in RAM and concurrent exports do not multiply into an
+/// unbounded-memory amplifier. The matched slice is still materialised because
+/// the response is a JSON array; bounding it further (pagination, per-tenant log
+/// shards) is the next step as pack volume grows.
 async fn export_audit(
     State(state): State<AppState>,
     Query(query): Query<ExportQuery>,
@@ -719,14 +739,14 @@ async fn export_audit(
     }
 
     // ─ Step 4: Actual export. ─────────────────────────────────────
-    let entries = audit::read_audit_logs(&state.audit_log_path)
+    //
+    // Stream the log line-by-line and keep only this tenant's entries (PRX-04),
+    // so the whole file is never read into RAM. The tenant filter is applied
+    // inside the streaming read, not after, so a misbehaving caller cannot read
+    // another tenant's entries by post-processing.
+    let filtered = audit::read_tenant_entries_streaming(&state.audit_log_path, &query.tenant_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let filtered: Vec<audit::AuditEntry> = entries
-        .into_iter()
-        .filter(|e| e.tenant_id == query.tenant_id)
-        .collect();
 
     Ok(Json(filtered))
 }
@@ -763,8 +783,9 @@ fn parse_u32_env(name: &str, default: u32) -> u32 {
 ///
 /// We accept the common spellings ("true"/"false"/"1"/"0"/"yes"/"no")
 /// because operators write env files by hand and a strict parser leads
-/// to silently-wrong DRY_RUN settings (which is exactly the failure mode
-/// we cannot tolerate).
+/// to silently-wrong safety toggles (e.g. `ALLOW_INSECURE`,
+/// `VYROX_PROXY_ALLOW_EPHEMERAL_NONCE`), which is exactly the failure mode we
+/// cannot tolerate.
 fn parse_bool_env(name: &str, default: bool) -> bool {
     match env::var(name) {
         Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
@@ -784,10 +805,70 @@ fn parse_bool_env(name: &str, default: bool) -> bool {
     }
 }
 
+/// Resolve the HMAC secret used to verify proxy requests (SRF-07).
+///
+/// Mirrors the Python signer's `effective_proxy_secret()`: prefer the
+/// dedicated `VYROX_PROXY_SECRET`, fall back to the shared `VYROX_HMAC_SECRET`.
+/// The two sides must resolve to the same value or every signed call 401s.
+///
+/// In production we fail closed if neither is set: serving with no secret would
+/// silently disable authentication on the one component that talks to a real
+/// EDR. In dev/CI a missing secret is still fatal (there is nothing to verify
+/// against), but the message is the same; we never invent a default.
+///
+/// HKDF / per-tenant key derivation is deliberately NOT done this wave, to keep
+/// the Rust and Python sides in lockstep.
+fn resolve_proxy_secret(is_production: bool) -> String {
+    let dedicated = env::var("VYROX_PROXY_SECRET").unwrap_or_default();
+    if !dedicated.trim().is_empty() {
+        return dedicated;
+    }
+    let shared = env::var("VYROX_HMAC_SECRET").unwrap_or_default();
+    if !shared.trim().is_empty() {
+        warn!(
+            "VYROX_PROXY_SECRET is not set; verifying containment proxy requests with the shared \
+             VYROX_HMAC_SECRET (dev/test fallback). Set a dedicated VYROX_PROXY_SECRET so a leak \
+             of the inter-service secret cannot authorize an EDR action."
+        );
+        return shared;
+    }
+    if is_production {
+        panic!(
+            "neither VYROX_PROXY_SECRET nor VYROX_HMAC_SECRET is set in production: refusing to \
+             start the containment proxy with no signing secret, which would disable \
+             authentication on every /execute and /rollback. Set VYROX_PROXY_SECRET (SRF-07)."
+        );
+    }
+    panic!(
+        "neither VYROX_PROXY_SECRET nor VYROX_HMAC_SECRET is set: the proxy has no secret to \
+         verify request signatures against. Set VYROX_PROXY_SECRET (preferred) or \
+         VYROX_HMAC_SECRET."
+    );
+}
+
+/// Decide whether this is a production boot.
+///
+/// The proxy has no first-class environment field, so it reads the same
+/// `VYROX_ENV` / `ENVIRONMENT` the rest of the platform sets (`VYROX_ENV` wins).
+/// Only an explicit "production" (case-insensitive) counts; anything else, or
+/// nothing, is treated as dev/CI. We fail closed only when we are SURE the boot
+/// is production, so a forgotten env var never silently relaxes a prod gate in
+/// the other direction: it just means the explicit dev opt-ins remain required.
+fn is_production_env() -> bool {
+    for var in ["VYROX_ENV", "ENVIRONMENT"] {
+        if let Ok(value) = env::var(var) {
+            if value.trim().eq_ignore_ascii_case("production") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Assemble the Axum router with the rate-limit layer over a given state.
 ///
 /// Extracted from `main` so the full HTTP path (HMAC, replay, nonce, audit,
-/// DRY_RUN, dispatch) is exercisable in-process by the test suite via
+/// dispatch) is exercisable in-process by the test suite via
 /// `tower::ServiceExt::oneshot`, with no real socket and no live EDR.
 fn build_router(state: AppState) -> Router {
     Router::new()
@@ -799,6 +880,13 @@ fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Marker the EDR error Display strings put right before the raw EDR response
+/// body, e.g. `edr returned client error 403: {body}`. The scrubber redacts
+/// everything after this marker so a captured EDR body never reaches Sentry.
+const EDR_BODY_MARKER: &str = " error ";
+/// What the scrubbed EDR body is replaced with in any outbound Sentry event.
+const EDR_BODY_REDACTED: &str = "[edr-body-redacted]";
+
 /// Initialize Sentry error tracking (T31).
 ///
 /// Reads `SENTRY_DSN` from the environment. When it is unset or empty the
@@ -806,6 +894,14 @@ fn build_router(state: AppState) -> Router {
 /// transport and sends nothing, so dev/CI and unconfigured deploys are
 /// unaffected. The caller MUST hold the returned guard for the life of the
 /// process; dropping it flushes and shuts the client down.
+///
+/// PRX-05: a `before_send` hook scrubs the raw EDR response body out of every
+/// outbound event. Today the EDR body lives only in an `EdrError` that is
+/// mapped to an HTTP status and never returned to the client or sent to Sentry
+/// (the `warn!` path is not wired to Sentry). This is defense in depth: if the
+/// body ever reaches an event, via a panic carrying the error string or a
+/// future tracing-to-Sentry bridge, it is redacted before egress. The Python
+/// `scrub.py` does not cover this Rust path, so the proxy owns it.
 fn init_sentry() -> sentry::ClientInitGuard {
     let dsn = env::var("SENTRY_DSN").unwrap_or_default();
     if dsn.trim().is_empty() {
@@ -819,9 +915,46 @@ fn init_sentry() -> sentry::ClientInitGuard {
         sentry::ClientOptions {
             release: sentry::release_name!(),
             environment,
+            before_send: Some(Arc::new(|mut event| {
+                scrub_edr_body_from_event(&mut event);
+                Some(event)
+            })),
             ..Default::default()
         },
     ))
+}
+
+/// Redact any captured EDR response body from a Sentry event before it leaves
+/// the process (PRX-05).
+///
+/// The EDR body only ever appears in an `EdrError` Display string of the form
+/// `edr returned {client|server} error {status}: {body}`. We redact the message
+/// and every exception value at the first `EDR_BODY_MARKER` occurrence, keeping
+/// the diagnostic prefix (which error, which status) but dropping the raw body.
+fn scrub_edr_body_from_event(event: &mut sentry::protocol::Event) {
+    if let Some(message) = event.message.take() {
+        event.message = Some(redact_after_edr_marker(&message));
+    }
+    for exception in &mut event.exception.values {
+        if let Some(value) = &exception.value {
+            exception.value = Some(redact_after_edr_marker(value));
+        }
+    }
+}
+
+/// If `text` looks like an EDR error string (`... error {status}: {body}`),
+/// return it with everything after the status colon replaced by a redaction
+/// marker. Otherwise return it unchanged. Pure so it is unit-testable.
+fn redact_after_edr_marker(text: &str) -> String {
+    if !text.contains("edr returned") || !text.contains(EDR_BODY_MARKER) {
+        return text.to_string();
+    }
+    // The body follows the first ": " after the status code. Keep the prefix
+    // (which error, which status), redact the rest.
+    match text.find(": ") {
+        Some(idx) => format!("{}: {EDR_BODY_REDACTED}", &text[..idx]),
+        None => text.to_string(),
+    }
 }
 
 /// Application entry point.
@@ -839,18 +972,28 @@ fn main() {
 async fn run() {
     tracing_subscriber::fmt::init();
 
-    // Required: secret used for HMAC verification. We refuse to start
-    // without it - running with a default would silently disable auth.
-    let hmac_secret = env::var("VYROX_HMAC_SECRET").expect("VYROX_HMAC_SECRET must be set");
+    // Decide once whether this is a production boot. Drives the two fail-closed
+    // gates below (proxy secret, nonce durability). The proxy has no first-class
+    // environment field, so we read the same `VYROX_ENV`/`ENVIRONMENT` the rest
+    // of the platform uses; absent or any non-"production" value is treated as
+    // dev/CI (the safe direction is to fail closed only when we are SURE it is
+    // production).
+    let is_production = is_production_env();
+
+    // Secret used to verify the HMAC on every /execute, /rollback and
+    // /audit/export request. Mirrors the Python signer's
+    // `effective_proxy_secret()` (SRF-07): prefer the dedicated
+    // `VYROX_PROXY_SECRET`, fall back to the shared `VYROX_HMAC_SECRET`. The two
+    // sides MUST resolve to the same value or every call 401s. In production we
+    // fail closed if neither is set; running with a default would silently
+    // disable auth. (Per-tenant HKDF key derivation is deferred to keep this
+    // wave in lockstep with the Python side.)
+    let hmac_secret = resolve_proxy_secret(is_production);
     if hmac_secret.len() < 32 {
-        warn!("VYROX_HMAC_SECRET is shorter than 32 bytes; consider rotating to a longer key");
+        warn!("proxy signing secret is shorter than 32 bytes; consider rotating to a longer key");
     }
 
     let audit_log_path = env::var("AUDIT_LOG_PATH").unwrap_or_else(|_| "./audit.jsonl".to_string());
-
-    // Safe-by-default: DRY_RUN is TRUE unless explicitly turned off.
-    // Operators who want real execution must opt in.
-    let dry_run = parse_bool_env("DRY_RUN", true);
 
     // Initialize the EDR client. See `edr.rs` for the configuration
     // contract - secrets are read from env there, not here.
@@ -862,23 +1005,54 @@ async fn run() {
     let audit_chain = audit::ChainState::from_file(&audit_log_path).await;
 
     // Build the nonce/replay store. Prefers a durable Redis backend
-    // (NONCE_REDIS_URL/REDIS_URL); falls back to in-memory with a loud warning
-    // when no Redis URL is set. A configured-but-unreachable Redis is a hard
-    // boot error, the operator asked for durability and we will not silently
-    // downgrade to the restart-double-execute path.
+    // (NONCE_REDIS_URL/REDIS_URL); falls back to in-memory only when no Redis
+    // URL is set. A configured-but-unreachable Redis is a hard boot error, the
+    // operator asked for durability and we will not silently downgrade to the
+    // restart-double-execute path.
+    //
+    // PRX-01: a MISSING Redis URL is itself fatal in production (and in any
+    // boot that has not explicitly opted into the ephemeral store). The
+    // in-memory store loses its dedup table on restart, so a retry crossing a
+    // restart re-executes containment (double-isolate / double-bill). We refuse
+    // to serve that path by omission; dev/CI must opt in with
+    // `VYROX_PROXY_ALLOW_EPHEMERAL_NONCE=1`, mirroring how `ALLOW_INSECURE`
+    // gates the cleartext bind. This is enforced BEFORE we build the store so a
+    // missing URL never reaches the in-memory fallback unacknowledged.
+    let allow_ephemeral_nonce = parse_bool_env("VYROX_PROXY_ALLOW_EPHEMERAL_NONCE", false);
+    if nonce::redis_url_configured() {
+        // A URL is set: from_env returns Redis or hard-errors on an unreachable
+        // one. Either is correct, never the silent in-memory downgrade.
+    } else if is_production {
+        panic!(
+            "no Redis URL configured (NONCE_REDIS_URL/REDIS_URL) in production: the in-memory \
+             nonce store loses its dedup table on restart, so a retry crossing a restart can \
+             double-execute a containment action. Configure Redis for durable, shared dedup. \
+             (VYROX_PROXY_ALLOW_EPHEMERAL_NONCE is ignored in production.)"
+        );
+    } else if !allow_ephemeral_nonce {
+        panic!(
+            "no Redis URL configured (NONCE_REDIS_URL/REDIS_URL): refusing to fall back to the \
+             in-memory nonce store, which is not durable and would re-execute a containment on a \
+             retry crossing a restart. Set REDIS_URL, or set \
+             VYROX_PROXY_ALLOW_EPHEMERAL_NONCE=1 to explicitly accept the ephemeral store for \
+             local dev / CI."
+        );
+    }
     let nonces = nonce::NonceStore::from_env()
         .await
         .expect("failed to connect to the configured Redis nonce store");
     if nonces.is_durable() {
         info!("nonce store backend: redis (durable, shared)");
     } else {
-        info!("nonce store backend: in-memory (NOT durable; dev/CI only)");
+        info!(
+            "nonce store backend: in-memory (NOT durable; dev/CI only, explicitly opted in via \
+             VYROX_PROXY_ALLOW_EPHEMERAL_NONCE)"
+        );
     }
 
     let state = AppState {
         hmac_secret,
         audit_log_path,
-        dry_run,
         nonces,
         edr,
         audit_chain,
@@ -901,7 +1075,7 @@ async fn run() {
 
     match (tls_cert, tls_key) {
         (Some(cert), Some(key)) => {
-            info!(addr = %bind_addr, tls = true, dry_run, "vyrox proxy starting (TLS)");
+            info!(addr = %bind_addr, tls = true, is_production, "vyrox proxy starting (TLS)");
             let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
                 .await
                 .expect("failed to load TLS cert/key - check TLS_CERT_PATH and TLS_KEY_PATH");
@@ -936,7 +1110,7 @@ async fn run() {
                      acknowledge the risk explicitly."
                 );
             }
-            info!(addr = %bind_addr, tls = false, dry_run, "vyrox proxy starting (plain HTTP)");
+            info!(addr = %bind_addr, tls = false, is_production, "vyrox proxy starting (plain HTTP)");
             let listener = tokio::net::TcpListener::bind(&bind_addr)
                 .await
                 .expect("bind should work");
@@ -1043,6 +1217,33 @@ mod tests {
     }
 
     #[test]
+    fn edr_body_scrubber_redacts_body_keeps_prefix() {
+        // PRX-05: the raw EDR response body is redacted, the diagnostic prefix
+        // (which error, which status) is kept. Mirrors the EdrError Display
+        // shapes from edr.rs.
+        let client = redact_after_edr_marker(
+            "edr returned client error 403: {\"secret\":\"leak\",\"detail\":\"forbidden\"}",
+        );
+        assert_eq!(client, "edr returned client error 403: [edr-body-redacted]");
+
+        let server = redact_after_edr_marker(
+            "edr returned server error 500: stacktrace with hostnames and ids",
+        );
+        assert_eq!(server, "edr returned server error 500: [edr-body-redacted]");
+
+        // Unrelated messages pass through untouched.
+        let unrelated = redact_after_edr_marker("nonce store unavailable; failing closed");
+        assert_eq!(unrelated, "nonce store unavailable; failing closed");
+
+        // A transport error has no body to leak and is left alone.
+        let transport = redact_after_edr_marker("edr transport error: connection refused");
+        assert_eq!(
+            transport, "edr transport error: connection refused",
+            "transport errors carry no EDR body, leave them readable"
+        );
+    }
+
+    #[test]
     fn parse_u32_env_rejects_zero_and_garbage() {
         std::env::set_var("VYROX_TEST_RL", "0");
         assert_eq!(parse_u32_env("VYROX_TEST_RL", 50), 50, "zero -> default");
@@ -1058,8 +1259,7 @@ mod tests {
     //
     // These drive the assembled router in-process with `tower::oneshot`,
     // so the whole path (HMAC, replay window, nonce, audit-before-act,
-    // DRY_RUN short-circuit, EDR dispatch) is exercised with no socket and
-    // no live EDR.
+    // EDR dispatch) is exercised with no socket and no live EDR.
 
     use axum::body::Body;
     use axum::http::Request;
@@ -1080,25 +1280,23 @@ mod tests {
         }
     }
 
-    /// Build a router with a known secret and a temp audit log. `dry_run`
-    /// toggles the EDR short-circuit; `edr` is the global fallback client.
-    fn test_router(dry_run: bool, edr: edr::EdrClient) -> (Router, TempDir) {
-        test_router_with_limiter(dry_run, edr, permissive_limiter())
+    /// Build a router with a known secret and a temp audit log. `edr` is the
+    /// global fallback client. The proxy always dispatches to the EDR now (the
+    /// DRY_RUN kill-switch is gone), so a `Noop` fallback is what lets a test
+    /// exercise the dispatch path without a live EDR; a per-tenant credential
+    /// on the request overrides it.
+    fn test_router(edr: edr::EdrClient) -> (Router, TempDir) {
+        test_router_with_limiter(edr, permissive_limiter())
     }
 
     /// Same as `test_router` but with a caller-supplied limiter, so the
     /// per-tenant isolation test can set a tiny per-tenant budget.
-    fn test_router_with_limiter(
-        dry_run: bool,
-        edr: edr::EdrClient,
-        rate: RateLimiter,
-    ) -> (Router, TempDir) {
+    fn test_router_with_limiter(edr: edr::EdrClient, rate: RateLimiter) -> (Router, TempDir) {
         let dir = TempDir::new().expect("tempdir");
         let audit_log_path = dir.path().join("audit.jsonl").to_str().unwrap().to_string();
         let state = AppState {
             hmac_secret: TEST_SECRET.to_string(),
             audit_log_path,
-            dry_run,
             nonces: nonce::NonceStore::in_memory(),
             edr,
             audit_chain: audit::ChainState::genesis(),
@@ -1127,7 +1325,8 @@ mod tests {
     }
 
     /// Build a request body for `/execute` or `/rollback`. `creds` is the
-    /// optional per-tenant credential blob. Tenant defaults to "tenant-a".
+    /// optional per-tenant credential blob. Tenant defaults to "tenant-a",
+    /// `simulated` defaults to false (real fleet).
     fn action_body(request_id: &str, creds: Option<serde_json::Value>) -> Vec<u8> {
         action_body_for("tenant-a", request_id, creds)
     }
@@ -1139,7 +1338,7 @@ mod tests {
         request_id: &str,
         creds: Option<serde_json::Value>,
     ) -> Vec<u8> {
-        action_body_full(tenant_id, request_id, "HOST_ISOLATION", creds)
+        action_body_full(tenant_id, request_id, "HOST_ISOLATION", creds, false)
     }
 
     /// As `action_body` but with an explicit action_type, for the
@@ -1149,7 +1348,17 @@ mod tests {
         request_id: &str,
         creds: Option<serde_json::Value>,
     ) -> Vec<u8> {
-        action_body_full("tenant-a", request_id, action_type, creds)
+        action_body_full("tenant-a", request_id, action_type, creds, false)
+    }
+
+    /// As `action_body` but with the `simulated` honesty label set, for the
+    /// tests that prove the flag round-trips through audit + response.
+    fn action_body_simulated(
+        request_id: &str,
+        creds: Option<serde_json::Value>,
+        simulated: bool,
+    ) -> Vec<u8> {
+        action_body_full("tenant-a", request_id, "HOST_ISOLATION", creds, simulated)
     }
 
     /// Fully parameterised request-body builder backing the helpers above.
@@ -1158,6 +1367,7 @@ mod tests {
         request_id: &str,
         action_type: &str,
         creds: Option<serde_json::Value>,
+        simulated: bool,
     ) -> Vec<u8> {
         let mut obj = json!({
             "request_id": request_id,
@@ -1167,6 +1377,7 @@ mod tests {
             "host": "device-1",
             "approved_by": "analyst-jane",
             "approved_at": now_secs(),
+            "simulated": simulated,
         });
         if let Some(c) = creds {
             obj["edr_credentials"] = c;
@@ -1209,41 +1420,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_dry_run_short_circuits_and_audits() {
-        let (router, dir) = test_router(true, edr::EdrClient::Noop);
-        let body = action_body("req-exec-dry", None);
+    async fn execute_always_dispatches_and_audits() {
+        // The global DRY_RUN kill-switch is gone: the proxy ALWAYS dispatches.
+        // The Noop fallback stands in for the EDR so the dispatch path runs to
+        // completion without a live call, and the status is "executed", never
+        // the old "dry_run". The intent is audited before the action.
+        let (router, dir) = test_router(edr::EdrClient::Noop);
+        let body = action_body("req-exec", None);
         let (status, value) = post_json(&router, "/execute", body).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(value["status"], "dry_run");
-        assert_eq!(value["dry_run"], true);
-        // Audit-before-act: the entry is on disk even though no EDR ran.
+        assert_eq!(value["status"], "executed");
+        assert_eq!(value["simulated"], false);
+        // Audit-before-act: the entry is on disk.
         let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("audit log");
         assert!(log.contains("HostIsolation"));
     }
 
     #[tokio::test]
-    async fn rollback_dry_run_short_circuits_and_audits_rollback_action() {
-        let (router, dir) = test_router(true, edr::EdrClient::Noop);
-        let body = action_body("req-rb-dry", None);
+    async fn rollback_always_dispatches_and_audits_rollback_action() {
+        let (router, dir) = test_router(edr::EdrClient::Noop);
+        let body = action_body("req-rb", None);
         let (status, value) = post_json(&router, "/rollback", body).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(value["status"], "dry_run");
-        assert_eq!(value["dry_run"], true);
+        assert_eq!(value["status"], "rolled_back");
+        assert_eq!(value["simulated"], false);
         // The audit entry names the rollback so the trail shows what was undone.
         let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("audit log");
         assert!(log.contains("ROLLBACK_HostIsolation"));
     }
 
     #[tokio::test]
-    async fn rollback_real_dispatch_succeeds_via_noop_fallback() {
-        // dry_run=false but the global fallback is Noop, so the rollback
-        // dispatch path runs to completion and reports rolled_back.
-        let (router, _dir) = test_router(false, edr::EdrClient::Noop);
-        let body = action_body("req-rb-live", None);
-        let (status, value) = post_json(&router, "/rollback", body).await;
+    async fn simulated_flag_round_trips_through_response_and_audit() {
+        // A demo/mock tenant sends simulated=true. It does NOT change behavior
+        // (the proxy still dispatches, here to the Noop fallback), but it MUST
+        // be echoed in the response and recorded in the audit entry so the
+        // evidence shows the action targeted a demo/mock fleet.
+        let (router, dir) = test_router(edr::EdrClient::Noop);
+        let body = action_body_simulated("req-sim", None, true);
+        let (status, value) = post_json(&router, "/execute", body).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(value["status"], "rolled_back");
-        assert_eq!(value["dry_run"], false);
+        assert_eq!(value["status"], "executed", "still dispatches; not skipped");
+        assert_eq!(value["simulated"], true, "honesty label echoed back");
+        // The audit entry carries simulated:true.
+        let entries = audit::read_audit_logs(dir.path().join("audit.jsonl").to_str().unwrap())
+            .await
+            .expect("read audit log");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.simulated && e.action_type == "HostIsolation"),
+            "the audit entry must record simulated=true"
+        );
     }
 
     #[tokio::test]
@@ -1252,7 +1479,7 @@ mod tests {
         // CrowdStrike credential pointed at an unreachable base_url, so a
         // 502 proves the proxy used the PER-TENANT credential, not the
         // global Noop fallback (which would have returned 200).
-        let (router, _dir) = test_router(false, edr::EdrClient::Noop);
+        let (router, _dir) = test_router(edr::EdrClient::Noop);
         let creds = json!({
             "provider": "crowdstrike",
             "api_key": "tenant-a-id",
@@ -1278,7 +1505,7 @@ mod tests {
         // host quarantine) and the audit trail must record both the intent
         // and the failure. The credential points at an unreachable address:
         // 501 (not 502 Transport) proves no EDR call was even attempted.
-        let (router, dir) = test_router(false, edr::EdrClient::Noop);
+        let (router, dir) = test_router(edr::EdrClient::Noop);
         let creds = json!({
             "provider": "crowdstrike",
             "api_key": "tenant-a-id",
@@ -1306,7 +1533,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_kill_unsupported_on_sentinelone_returns_501() {
-        let (router, _dir) = test_router(false, edr::EdrClient::Noop);
+        let (router, _dir) = test_router(edr::EdrClient::Noop);
         let creds = json!({
             "provider": "sentinelone",
             "api_key": "",
@@ -1320,70 +1547,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_kill_dry_run_predicts_production_501() {
-        // The supportability check runs BEFORE the dry-run short-circuit,
-        // so a rehearsal of an action the provider cannot perform returns
-        // the same 501 production would. The check is pure (action-name
-        // mappers only) and the credential points at an unreachable
-        // address: 501 (not 502 Transport) proves no EDR call was even
-        // attempted, so Rule #5 still holds.
-        let (router, dir) = test_router(true, edr::EdrClient::Noop);
+    async fn process_kill_unsupported_fails_before_any_edr_call() {
+        // An unsupported action must fail loudly with 501 BEFORE any network
+        // call, never be silently substituted with a broader containment. The
+        // supportability check is pure (action-name mappers only) and the
+        // credential points at an unreachable address: 501 (not 502 Transport)
+        // proves no EDR call was attempted. This held under the old DRY_RUN
+        // gate and must still hold now that the proxy always dispatches.
+        let (router, dir) = test_router(edr::EdrClient::Noop);
         let creds = json!({
             "provider": "crowdstrike",
             "api_key": "tenant-a-id",
             "api_secret": "tenant-a-secret",
             "base_url": "http://127.0.0.1:1",
         });
-        let body = action_body_with_type("PROCESS_KILL", "req-kill-dry", Some(creds));
+        let body = action_body_with_type("PROCESS_KILL", "req-kill-pure", Some(creds));
         let (status, _) = post_json(&router, "/execute", body).await;
         assert_eq!(
             status,
             StatusCode::NOT_IMPLEMENTED,
-            "dry-run must predict the production 501 for unsupported actions"
+            "unsupported action must be 501, attempted before any EDR call"
         );
-        // The trail mirrors production too: intent entry plus a FAILED_
-        // companion so the rehearsal does not read as a success.
+        // Intent entry plus a FAILED_ companion so the trail does not read as
+        // a success.
         let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("audit log");
         assert!(log.contains("\"ProcessKill\""));
         assert!(log.contains("\"FAILED_ProcessKill\""));
     }
 
     #[tokio::test]
-    async fn process_kill_dry_run_on_sentinelone_returns_501() {
-        let (router, _dir) = test_router(true, edr::EdrClient::Noop);
+    async fn process_kill_unsupported_on_sentinelone_fails_before_any_call() {
+        let (router, _dir) = test_router(edr::EdrClient::Noop);
         let creds = json!({
             "provider": "sentinelone",
             "api_key": "",
             "api_secret": "tenant-b-token",
             "base_url": "http://127.0.0.1:1",
         });
-        let body = action_body_with_type("PROCESS_KILL", "req-kill-dry-s1", Some(creds));
+        let body = action_body_with_type("PROCESS_KILL", "req-kill-pure-s1", Some(creds));
         let sig = sign_body(&body);
         let status = post(&router, "/execute", body, Some(sig)).await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
-    async fn host_isolation_dry_run_with_creds_still_short_circuits() {
-        // Supported actions are untouched by the reorder: dry-run still
-        // returns dry-run success with ZERO network calls. The credential
-        // points at an unreachable address, so anything other than
-        // dry_run success would mean a call left the proxy (Rule #5).
-        let (router, dir) = test_router(true, edr::EdrClient::Noop);
+    async fn supported_action_with_creds_always_dispatches_no_short_circuit() {
+        // There is no DRY_RUN short-circuit anymore: a supported action with a
+        // usable per-tenant credential ALWAYS attempts the real EDR call. The
+        // credential points at an unreachable address, so the proxy reaches the
+        // transport and returns 502, proving the call left the proxy rather than
+        // being skipped. Under the old gate this returned a "dry_run" success
+        // with zero network calls; that path is gone.
+        let (router, dir) = test_router(edr::EdrClient::Noop);
         let creds = json!({
             "provider": "crowdstrike",
             "api_key": "tenant-a-id",
             "api_secret": "tenant-a-secret",
             "base_url": "http://127.0.0.1:1",
         });
-        let body = action_body("req-iso-dry-creds", Some(creds));
-        let (status, value) = post_json(&router, "/execute", body).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(value["status"], "dry_run");
-        assert_eq!(value["dry_run"], true);
+        let body = action_body("req-iso-creds", Some(creds));
+        let sig = sign_body(&body);
+        let status = post(&router, "/execute", body, Some(sig)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "supported action must attempt the real call, not short-circuit"
+        );
+        // Intent audited, plus a FAILED_ companion for the transport failure.
         let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("audit log");
         assert!(log.contains("\"HostIsolation\""));
-        assert!(!log.contains("FAILED_"));
+        assert!(log.contains("\"FAILED_HostIsolation\""));
     }
 
     #[tokio::test]
@@ -1391,7 +1624,7 @@ mod tests {
         // A reachable-looking but dead EDR (transport failure) must leave a
         // FAILED_ entry next to the intent entry, so an auditor reading the
         // trail can tell intent from outcome.
-        let (router, dir) = test_router(false, edr::EdrClient::Noop);
+        let (router, dir) = test_router(edr::EdrClient::Noop);
         let creds = json!({
             "provider": "crowdstrike",
             "api_key": "tenant-a-id",
@@ -1409,7 +1642,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_signature_is_unauthorized() {
-        let (router, _dir) = test_router(true, edr::EdrClient::Noop);
+        let (router, _dir) = test_router(edr::EdrClient::Noop);
         let body = action_body("req-nosig", None);
         let status = post(&router, "/execute", body, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -1417,7 +1650,7 @@ mod tests {
 
     #[tokio::test]
     async fn bad_signature_is_unauthorized_on_rollback() {
-        let (router, _dir) = test_router(true, edr::EdrClient::Noop);
+        let (router, _dir) = test_router(edr::EdrClient::Noop);
         let body = action_body("req-badsig", None);
         let status = post(&router, "/rollback", body, Some("sha256=deadbeef".into())).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -1425,7 +1658,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_timestamp_is_rejected_by_replay_window() {
-        let (router, _dir) = test_router(true, edr::EdrClient::Noop);
+        let (router, _dir) = test_router(edr::EdrClient::Noop);
         // approved_at far in the past: outside the 30s replay window.
         let mut obj = json!({
             "request_id": "req-stale",
@@ -1445,11 +1678,11 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_request_id_is_replayed_not_re_executed() {
-        let (router, _dir) = test_router(true, edr::EdrClient::Noop);
+        let (router, _dir) = test_router(edr::EdrClient::Noop);
         let body = action_body("req-dup", None);
         let (s1, v1) = post_json(&router, "/execute", body.clone()).await;
         assert_eq!(s1, StatusCode::OK);
-        assert_eq!(v1["status"], "dry_run");
+        assert_eq!(v1["status"], "executed");
         // Same request_id again: cached replay, not a second execution.
         let (s2, v2) = post_json(&router, "/execute", body).await;
         assert_eq!(s2, StatusCode::OK);
@@ -1470,7 +1703,7 @@ mod tests {
             tenants: Arc::new(DashMap::new()),
             global: Arc::new(Mutex::new((Instant::now(), 0))),
         };
-        let (router, _dir) = test_router_with_limiter(true, edr::EdrClient::Noop, limiter);
+        let (router, _dir) = test_router_with_limiter(edr::EdrClient::Noop, limiter);
 
         // Tenant A: first two succeed, the rest are throttled (429).
         let a1 = action_body_for("tenant-a", "a-1", None);
@@ -1493,14 +1726,14 @@ mod tests {
         let (sb2, vb2) = post_json(&router, "/execute", b2).await;
         assert_eq!(sb1, StatusCode::OK, "B #1 must be ok despite A's burst");
         assert_eq!(sb2, StatusCode::OK, "B #2 must be ok despite A's burst");
-        assert_eq!(vb1["status"], "dry_run");
-        assert_eq!(vb2["status"], "dry_run");
+        assert_eq!(vb1["status"], "executed");
+        assert_eq!(vb2["status"], "executed");
     }
 
     // ── End-to-end: execute then rollback against a stateful mock EDR ──────
     //
-    // The tests above short-circuit the EDR (DRY_RUN) or point a per-tenant
-    // credential at an unreachable address. This one proves the WHOLE loop:
+    // The tests above use the Noop fallback or point a per-tenant credential at
+    // an unreachable address. This one proves the WHOLE loop:
     // the proxy verifies the request, audits, and drives a REAL EDR call (over
     // loopback HTTP) that isolates a host on /execute and un-isolates it on
     // /rollback. A tiny stateful mock EDR implements the exact CrowdStrike
@@ -1600,9 +1833,9 @@ mod tests {
     #[tokio::test]
     async fn execute_then_rollback_isolates_then_unisolates_against_mock_edr() {
         let (edr_base, edr_state) = spawn_mock_edr().await;
-        // Real dispatch (dry_run=false); the global fallback is Noop and must
-        // NOT be used because the per-tenant credential is present and usable.
-        let (router, dir) = test_router(false, edr::EdrClient::Noop);
+        // Real dispatch; the global fallback is Noop and must NOT be used
+        // because the per-tenant credential is present and usable.
+        let (router, dir) = test_router(edr::EdrClient::Noop);
 
         let creds = json!({
             "provider": "crowdstrike",
@@ -1617,7 +1850,7 @@ mod tests {
         let (exec_status, exec_value) = post_json(&router, "/execute", exec_body).await;
         assert_eq!(exec_status, StatusCode::OK);
         assert_eq!(exec_value["status"], "executed");
-        assert_eq!(exec_value["dry_run"], false);
+        assert_eq!(exec_value["simulated"], false);
         assert_eq!(
             edr_state.lock().unwrap().get(host).copied(),
             Some(true),
@@ -1629,7 +1862,7 @@ mod tests {
         let (rb_status, rb_value) = post_json(&router, "/rollback", rb_body).await;
         assert_eq!(rb_status, StatusCode::OK);
         assert_eq!(rb_value["status"], "rolled_back");
-        assert_eq!(rb_value["dry_run"], false);
+        assert_eq!(rb_value["simulated"], false);
         assert_eq!(
             edr_state.lock().unwrap().get(host).copied(),
             Some(false),
@@ -1649,6 +1882,54 @@ mod tests {
         assert!(
             actions.contains(&"ROLLBACK_HostIsolation"),
             "rollback must be audited, saw {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn simulated_demo_tenant_runs_real_path_against_mock_edr() {
+        // The milestone case: a demo/mock tenant (simulated=true) is NOT
+        // short-circuited. The proxy runs the SAME real execute path, the
+        // per-tenant credential just points it at the bundled mock EDR, so the
+        // host is genuinely isolated on the (mock) fleet AND the honesty label
+        // is echoed in the response and recorded in the audit/evidence. This is
+        // the end-to-end replacement for the old DRY_RUN behaviour.
+        let (edr_base, edr_state) = spawn_mock_edr().await;
+        let (router, dir) = test_router(edr::EdrClient::Noop);
+
+        let creds = json!({
+            "provider": "crowdstrike",
+            "api_key": "demo-tenant-client-id",
+            "api_secret": "demo-tenant-client-secret",
+            "base_url": edr_base,
+        });
+        let host = "device-1";
+
+        let body = action_body_simulated("sim-exec", Some(creds), true);
+        let (status, value) = post_json(&router, "/execute", body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            value["status"], "executed",
+            "the real path ran; not skipped"
+        );
+        assert_eq!(value["simulated"], true, "honesty label echoed");
+
+        // The mock EDR really isolated the host: the real call ran.
+        assert_eq!(
+            edr_state.lock().unwrap().get(host).copied(),
+            Some(true),
+            "the real execute path must have reached the mock EDR"
+        );
+
+        // The audit entry records simulated=true so the evidence shows the
+        // action targeted a demo/mock fleet.
+        let entries = audit::read_audit_logs(dir.path().join("audit.jsonl").to_str().unwrap())
+            .await
+            .expect("read audit log");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.simulated && e.action_type == "HostIsolation"),
+            "the executed entry must carry simulated=true"
         );
     }
 
@@ -1678,7 +1959,7 @@ mod tests {
             axum::serve(listener, app).await.expect("serve");
         });
 
-        let (router, _dir) = test_router(false, edr::EdrClient::Noop);
+        let (router, _dir) = test_router(edr::EdrClient::Noop);
         let creds = json!({
             "provider": "crowdstrike",
             "api_key": "id",
