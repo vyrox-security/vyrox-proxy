@@ -593,7 +593,10 @@ mod tests {
         for _ in 0..64 {
             let m = map.clone();
             handles.push(std::thread::spawn(move || {
-                matches!(claim_memory(&m, "hot-key"), Outcome::FreshClaim)
+                matches!(
+                    claim_memory(&m, "hot-key", DEFAULT_RETENTION_SECONDS),
+                    Outcome::FreshClaim
+                )
             }));
         }
         let fresh_wins: usize = handles
@@ -612,7 +615,7 @@ mod tests {
         // eviction keeps memory bounded. Regression for the OOM gap.
         let map: Arc<DashMap<String, Record>> = Arc::new(DashMap::new());
         for i in 0..(MAX_RECORDS + 1_000) {
-            let _ = claim_memory(&map, &format!("burst-{i}"));
+            let _ = claim_memory(&map, &format!("burst-{i}"), DEFAULT_RETENTION_SECONDS);
         }
         assert!(
             map.len() <= MAX_RECORDS,
