@@ -128,6 +128,17 @@ fn retention_seconds() -> u64 {
         .unwrap_or(DEFAULT_RETENTION_SECONDS)
 }
 
+/// True when a Redis URL is configured (`NONCE_REDIS_URL` or `REDIS_URL`).
+///
+/// Lets `main` decide BEFORE building the store whether a missing URL should be
+/// a hard boot error (PRX-01). A configured-but-unreachable URL is handled by
+/// `from_env` (it hard-errors); this only distinguishes "URL present" from "no
+/// URL at all", which is the case that would otherwise silently fall back to
+/// the non-durable in-memory store.
+pub fn redis_url_configured() -> bool {
+    redis_url_from_env().is_some()
+}
+
 /// Resolve the Redis URL for the nonce store from the environment.
 ///
 /// `NONCE_REDIS_URL` wins over the shared `REDIS_URL`. A blank value is treated
@@ -256,7 +267,7 @@ impl NonceStore {
     ///   it is non-empty.
     pub async fn claim_or_replay(&self, request_id: &str) -> Result<Outcome, redis::RedisError> {
         match &self.backend {
-            Backend::Memory(map) => Ok(claim_memory(map, request_id)),
+            Backend::Memory(map) => Ok(claim_memory(map, request_id, self.ttl_seconds)),
             Backend::Redis(manager) => {
                 claim_redis(manager.clone(), request_id, self.ttl_seconds).await
             }
@@ -434,12 +445,12 @@ enum RecordState {
 
 /// Atomic claim-or-replay against the in-memory map. `DashMap::entry` makes the
 /// check-and-insert atomic per shard.
-fn claim_memory(map: &Arc<DashMap<String, Record>>, request_id: &str) -> Outcome {
+fn claim_memory(map: &Arc<DashMap<String, Record>>, request_id: &str, ttl_seconds: u64) -> Outcome {
     // Run eviction opportunistically on the claim path so memory is reclaimed
     // even with no background task. Only triggered at/above the cap to amortize
     // the cost.
     if map.len() >= MAX_RECORDS {
-        evict_expired(map);
+        evict_expired(map, ttl_seconds);
         // TTL eviction alone does NOT bound memory: an adversary (or a genuine
         // storm) sending > MAX_RECORDS unique request_ids inside the retention
         // window leaves every record younger than the cutoff, so `evict_expired`
@@ -480,9 +491,9 @@ fn record_memory(map: &Arc<DashMap<String, Record>>, request_id: &str, response_
     }
 }
 
-/// Drop records whose `created_at` is older than the retention window.
-fn evict_expired(map: &Arc<DashMap<String, Record>>) {
-    let cutoff = Duration::from_secs(DEFAULT_RETENTION_SECONDS);
+/// Drop records whose `created_at` is older than the configured retention window.
+fn evict_expired(map: &Arc<DashMap<String, Record>>, ttl_seconds: u64) {
+    let cutoff = Duration::from_secs(ttl_seconds);
     map.retain(|_, record| record.created_at.elapsed() < cutoff);
 }
 
@@ -582,7 +593,10 @@ mod tests {
         for _ in 0..64 {
             let m = map.clone();
             handles.push(std::thread::spawn(move || {
-                matches!(claim_memory(&m, "hot-key"), Outcome::FreshClaim)
+                matches!(
+                    claim_memory(&m, "hot-key", DEFAULT_RETENTION_SECONDS),
+                    Outcome::FreshClaim
+                )
             }));
         }
         let fresh_wins: usize = handles
@@ -601,7 +615,7 @@ mod tests {
         // eviction keeps memory bounded. Regression for the OOM gap.
         let map: Arc<DashMap<String, Record>> = Arc::new(DashMap::new());
         for i in 0..(MAX_RECORDS + 1_000) {
-            let _ = claim_memory(&map, &format!("burst-{i}"));
+            let _ = claim_memory(&map, &format!("burst-{i}"), DEFAULT_RETENTION_SECONDS);
         }
         assert!(
             map.len() <= MAX_RECORDS,
@@ -678,7 +692,10 @@ mod tests {
             "first claim must be fresh"
         );
         store1
-            .record_response(&req, r#"{"status":"executed","dry_run":false}"#.to_string())
+            .record_response(
+                &req,
+                r#"{"status":"executed","simulated":false}"#.to_string(),
+            )
             .await
             .unwrap();
 
@@ -698,7 +715,7 @@ mod tests {
                 cached_response_json,
             } => {
                 assert_eq!(
-                    cached_response_json, r#"{"status":"executed","dry_run":false}"#,
+                    cached_response_json, r#"{"status":"executed","simulated":false}"#,
                     "cached response must survive the restart"
                 );
             }

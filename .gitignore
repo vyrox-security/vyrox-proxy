@@ -5,10 +5,8 @@ target/
 .env
 .env.*
 audit.jsonl
+/audit
 *.log
-
-# Cargo generated
-Cargo.lock
 
 # Dev config
 .claude/

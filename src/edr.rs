@@ -45,12 +45,31 @@
 //! credentials differ per tenant). SentinelOne uses a static API token passed
 //! as `ApiToken` in the `Authorization` header. Tokens are never logged.
 //!
+//! ## Action mapping (honest by construction)
+//!
+//! Each `(ActionType, ActionDirection)` pair maps to exactly one vendor
+//! call, or fails loudly with `EdrError::Unsupported`. The proxy NEVER
+//! substitutes a different action for the one the operator approved. The
+//! one mapping that looks like a merge is genuine vendor semantics:
+//! CrowdStrike's `contain` and SentinelOne's `disconnect` are network
+//! containment primitives, so HOST_ISOLATION and NETWORK_QUARANTINE both
+//! map to them because that IS the vendor's isolation action, not a
+//! stand-in for something else.
+//!
+//! PROCESS_KILL is unsupported on both providers today and fails loudly:
+//! a true CrowdStrike kill needs a Real Time Response session plus a
+//! process id, and a SentinelOne kill via threat mitigation needs an S1
+//! threat id. The signed request carries neither (only the host / agent
+//! identifier), so the proxy refuses rather than quietly quarantining a
+//! whole host the operator never approved.
+//!
 //! ## Error mapping
 //!
 //! All transport, parsing, and HTTP-status errors collapse into the
-//! `EdrError` enum. The caller (in `main`) maps the error to `502 Bad
-//! Gateway` (for `/execute`) or pages a human (for `/rollback`) and releases
-//! the nonce so a retry can run on fresh state.
+//! `EdrError` enum. The caller (in `main`) maps `Unsupported` to `501 Not
+//! Implemented` and every other variant to `502 Bad Gateway` (for
+//! `/execute`) or pages a human (for `/rollback`), and releases the nonce
+//! so a retry can run on fresh state.
 
 use std::env;
 use std::sync::Arc;
@@ -60,7 +79,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::actions::{ActionDirection, ActionType};
 
@@ -69,9 +88,11 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Errors that can happen during an EDR dispatch.
 ///
-/// Callers should treat every variant the same on the wire (502 Bad
-/// Gateway) so failure modes are not externally distinguishable. The
-/// variants are for logging, metrics, and tests.
+/// Callers treat the transport-shaped variants the same on the wire (502
+/// Bad Gateway) so EDR failure modes are not externally distinguishable.
+/// `Unsupported` is the exception: it maps to 501 Not Implemented so the
+/// caller can tell "the EDR is down, retry" apart from "this action does
+/// not exist for this provider, do not retry".
 #[derive(Debug, Error)]
 pub enum EdrError {
     /// EDR was contacted but rejected the request (4xx).
@@ -98,6 +119,18 @@ pub enum EdrError {
     /// production call fails loudly.
     #[error("edr misconfigured: {0}")]
     Misconfigured(String),
+
+    /// The approved action has no faithful implementation on this
+    /// provider. Fails loudly INSTEAD of substituting a different action:
+    /// the operator approved a specific containment, and quietly doing
+    /// something broader (or narrower) would put an action nobody approved
+    /// on a production host and a lie in the audit trail.
+    #[error("{action:?} not supported for provider {provider} yet: {detail}. Refusing to substitute a different action")]
+    Unsupported {
+        action: ActionType,
+        provider: &'static str,
+        detail: &'static str,
+    },
 }
 
 /// Which EDR a per-tenant credential targets.
@@ -184,9 +217,11 @@ impl EdrClient {
     /// Build an `EdrClient` from environment variables.
     ///
     /// See module-level docs for the env-var contract. Defaults to
-    /// `Noop` if no provider is configured, which is safe-by-default
-    /// (mirrors `DRY_RUN=true` as a default). This is the dev/sandbox
-    /// fallback only; production routes per-tenant credentials instead.
+    /// `Noop` if no provider is configured, which is safe-by-default: the
+    /// proxy always dispatches, and with no global credential the Noop
+    /// fallback performs nothing rather than calling a real EDR. This is the
+    /// dev/sandbox fallback only; production routes per-tenant credentials
+    /// instead.
     pub fn from_env() -> Self {
         let provider = env::var("EDR_PROVIDER").unwrap_or_else(|_| "noop".to_string());
         match provider.trim().to_ascii_lowercase().as_str() {
@@ -297,6 +332,38 @@ pub async fn dispatch(
             );
             fallback.dispatch_fallback(action, direction, host).await
         }
+    }
+}
+
+/// Pure supportability check: would `dispatch` have a faithful mapping for
+/// this action on the provider this request would target?
+///
+/// Mirrors `dispatch`'s provider selection (per-tenant credential first,
+/// global env fallback otherwise) but only consults the pure action-name
+/// mappers. It makes ZERO network calls and builds no HTTP client, so the
+/// request handler can run it BEFORE dispatching to fail an unsupported action
+/// loudly with a 501 instead of substituting a different action: the operator
+/// approved a specific containment, and the proxy refuses to do something
+/// broader.
+///
+/// `Noop` supports everything by construction: it performs nothing, so there
+/// is no mapping to be unfaithful to.
+pub fn check_supported(
+    fallback: &EdrClient,
+    creds: Option<&EdrCredentials>,
+    action: ActionType,
+    direction: ActionDirection,
+) -> Result<(), EdrError> {
+    let provider = match creds {
+        Some(c) if c.is_usable() => c.provider,
+        _ => match fallback {
+            EdrClient::Noop => return Ok(()),
+            EdrClient::Crowdstrike(_) => EdrProvider::Crowdstrike,
+        },
+    };
+    match provider {
+        EdrProvider::Crowdstrike => crowdstrike_action_name(action, direction).map(|_| ()),
+        EdrProvider::Sentinelone => sentinelone_action_path(action, direction).map(|_| ()),
     }
 }
 
@@ -441,7 +508,9 @@ impl CrowdstrikeClient {
         direction: ActionDirection,
         host: &str,
     ) -> Result<(), EdrError> {
-        let action_name = crowdstrike_action_name(action, direction, host);
+        // Resolve the vendor action BEFORE any network traffic. An
+        // unsupported action must fail here, with zero EDR calls made.
+        let action_name = crowdstrike_action_name(action, direction)?;
 
         let token = self.bearer_token().await?;
 
@@ -495,27 +564,34 @@ impl CrowdstrikeClient {
 }
 
 /// Map our internal `(ActionType, ActionDirection)` to the CrowdStrike
-/// action name on the query string.
+/// action name on the query string, or fail loudly if there is none.
 ///
-/// Apply = "contain", Reverse = "lift_containment". The mapping is
-/// documented in CrowdStrike's "Hosts" API reference. PROCESS_KILL falls
-/// back to host containment for v0.1-alpha (RTR scripting is post-pilot);
-/// we log that explicitly so it is never silent.
+/// The mapping is documented in CrowdStrike's "Hosts" API reference.
+/// `contain` is CrowdStrike's network containment primitive, so it is the
+/// faithful vendor call for BOTH `HOST_ISOLATION` and `NETWORK_QUARANTINE`
+/// (it is the same operation in Falcon, not a substitution).
+///
+/// `PROCESS_KILL` has no faithful mapping here: a real kill needs a Real
+/// Time Response session plus a process id, and the signed request carries
+/// neither. Until the wire contract grows a process identifier and an RTR
+/// client lands, the action fails loudly. It previously downgraded to host
+/// containment with only a log line, which executed an action the operator
+/// never approved; that downgrade is exactly what this function now forbids.
 fn crowdstrike_action_name(
     action: ActionType,
     direction: ActionDirection,
-    host: &str,
-) -> &'static str {
-    if action == ActionType::ProcessKill {
-        warn!(
-            host,
-            ?direction,
-            "PROCESS_KILL maps to HOST_ISOLATION for v0.1-alpha (RTR scripting is post-pilot)"
-        );
-    }
-    match direction {
-        ActionDirection::Apply => "contain",
-        ActionDirection::Reverse => "lift_containment",
+) -> Result<&'static str, EdrError> {
+    match action {
+        ActionType::HostIsolation | ActionType::NetworkQuarantine => Ok(match direction {
+            ActionDirection::Apply => "contain",
+            ActionDirection::Reverse => "lift_containment",
+        }),
+        ActionType::ProcessKill => Err(EdrError::Unsupported {
+            action,
+            provider: "crowdstrike",
+            detail: "a true kill needs a Real Time Response session and a process id, \
+                     and the signed request carries neither",
+        }),
     }
 }
 
@@ -560,17 +636,13 @@ impl SentinelOneClient {
 
     async fn dispatch(
         &self,
-        _action: ActionType,
+        action: ActionType,
         direction: ActionDirection,
         host: &str,
     ) -> Result<(), EdrError> {
-        // SentinelOne network containment: connect = network on (rollback),
-        // disconnect = network off (contain). The agents action endpoints
-        // are `/web/api/v2.1/agents/actions/{disconnect|connect}`.
-        let action_path = match direction {
-            ActionDirection::Apply => "disconnect",
-            ActionDirection::Reverse => "connect",
-        };
+        // Resolve the vendor action BEFORE any network traffic. An
+        // unsupported action must fail here, with zero EDR calls made.
+        let action_path = sentinelone_action_path(action, direction)?;
         let url = format!(
             "{}/web/api/v2.1/agents/actions/{}",
             self.base_url.trim_end_matches('/'),
@@ -617,6 +689,41 @@ impl SentinelOneClient {
     }
 }
 
+/// Map our internal `(ActionType, ActionDirection)` to the SentinelOne
+/// agents-action path segment, or fail loudly if there is none.
+///
+/// SentinelOne's network containment is `disconnect` (network off) and the
+/// rollback is `connect` (network on), at
+/// `/web/api/v2.1/agents/actions/{disconnect|connect}`. Disconnect IS the
+/// vendor's isolation primitive, so it is the faithful call for both
+/// `HOST_ISOLATION` and `NETWORK_QUARANTINE` (same operation, not a
+/// substitution). Previously the action type was ignored entirely and
+/// every action became a disconnect; this mapping makes that decision
+/// explicit and rejects what cannot be honoured.
+///
+/// `PROCESS_KILL` has no faithful mapping: S1 kills via threat mitigation
+/// (`/threats/mitigate/kill`), which needs an S1 threat id, and the signed
+/// request carries only the agent uuid. Until the wire contract carries a
+/// threat id, the action fails loudly instead of disconnecting a host the
+/// operator never asked to disconnect.
+fn sentinelone_action_path(
+    action: ActionType,
+    direction: ActionDirection,
+) -> Result<&'static str, EdrError> {
+    match action {
+        ActionType::HostIsolation | ActionType::NetworkQuarantine => Ok(match direction {
+            ActionDirection::Apply => "disconnect",
+            ActionDirection::Reverse => "connect",
+        }),
+        ActionType::ProcessKill => Err(EdrError::Unsupported {
+            action,
+            provider: "sentinelone",
+            detail: "killing via threat mitigation needs a SentinelOne threat id, \
+                     and the signed request carries only the agent uuid",
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,14 +755,192 @@ mod tests {
     }
 
     #[test]
+    fn check_supported_mirrors_dispatch_provider_selection() {
+        // Per-tenant CrowdStrike credential: PROCESS_KILL is unsupported,
+        // containment actions pass. No client is built, no call leaves.
+        let creds = cs_creds();
+        for dir in [ActionDirection::Apply, ActionDirection::Reverse] {
+            let err = check_supported(&EdrClient::Noop, Some(&creds), ActionType::ProcessKill, dir)
+                .expect_err("PROCESS_KILL has no faithful CrowdStrike mapping");
+            assert!(matches!(err, EdrError::Unsupported { .. }));
+            check_supported(
+                &EdrClient::Noop,
+                Some(&creds),
+                ActionType::HostIsolation,
+                dir,
+            )
+            .expect("host isolation is supported");
+        }
+    }
+
+    #[test]
+    fn check_supported_treats_noop_fallback_as_supporting_everything() {
+        // No usable credential and a Noop fallback: nothing real would run,
+        // so nothing is unsupported. Mirrors dispatch, which returns Ok.
+        for action in [
+            ActionType::HostIsolation,
+            ActionType::ProcessKill,
+            ActionType::NetworkQuarantine,
+        ] {
+            check_supported(&EdrClient::Noop, None, action, ActionDirection::Apply)
+                .expect("noop fallback supports every action");
+        }
+    }
+
+    #[test]
+    fn check_supported_unusable_credential_falls_back() {
+        // A blank credential is "not configured": supportability follows the
+        // fallback (Noop here), exactly like dispatch's routing.
+        let creds = EdrCredentials {
+            provider: EdrProvider::Crowdstrike,
+            api_key: "  ".to_string(),
+            api_secret: None,
+            base_url: None,
+        };
+        check_supported(
+            &EdrClient::Noop,
+            Some(&creds),
+            ActionType::ProcessKill,
+            ActionDirection::Apply,
+        )
+        .expect("unusable credential routes to the Noop fallback");
+    }
+
+    #[test]
     fn crowdstrike_action_name_maps_direction() {
         assert_eq!(
-            crowdstrike_action_name(ActionType::HostIsolation, ActionDirection::Apply, "h"),
+            crowdstrike_action_name(ActionType::HostIsolation, ActionDirection::Apply)
+                .expect("supported"),
             "contain"
         );
         assert_eq!(
-            crowdstrike_action_name(ActionType::HostIsolation, ActionDirection::Reverse, "h"),
+            crowdstrike_action_name(ActionType::HostIsolation, ActionDirection::Reverse)
+                .expect("supported"),
             "lift_containment"
+        );
+        // NETWORK_QUARANTINE is the same Falcon primitive (network
+        // containment), so it maps to the same vendor action honestly.
+        assert_eq!(
+            crowdstrike_action_name(ActionType::NetworkQuarantine, ActionDirection::Apply)
+                .expect("supported"),
+            "contain"
+        );
+        assert_eq!(
+            crowdstrike_action_name(ActionType::NetworkQuarantine, ActionDirection::Reverse)
+                .expect("supported"),
+            "lift_containment"
+        );
+    }
+
+    #[test]
+    fn crowdstrike_process_kill_is_unsupported_never_downgraded() {
+        // The old behaviour mapped PROCESS_KILL to "contain" with only a
+        // log line: the operator approved a surgical kill and got a full
+        // host quarantine. The mapping must now refuse, both directions.
+        for dir in [ActionDirection::Apply, ActionDirection::Reverse] {
+            let err = crowdstrike_action_name(ActionType::ProcessKill, dir)
+                .expect_err("PROCESS_KILL must not map to any CrowdStrike action");
+            assert!(
+                matches!(
+                    err,
+                    EdrError::Unsupported {
+                        action: ActionType::ProcessKill,
+                        provider: "crowdstrike",
+                        ..
+                    }
+                ),
+                "expected Unsupported, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sentinelone_action_path_maps_each_action_type() {
+        assert_eq!(
+            sentinelone_action_path(ActionType::HostIsolation, ActionDirection::Apply)
+                .expect("supported"),
+            "disconnect"
+        );
+        assert_eq!(
+            sentinelone_action_path(ActionType::HostIsolation, ActionDirection::Reverse)
+                .expect("supported"),
+            "connect"
+        );
+        assert_eq!(
+            sentinelone_action_path(ActionType::NetworkQuarantine, ActionDirection::Apply)
+                .expect("supported"),
+            "disconnect"
+        );
+        assert_eq!(
+            sentinelone_action_path(ActionType::NetworkQuarantine, ActionDirection::Reverse)
+                .expect("supported"),
+            "connect"
+        );
+    }
+
+    #[test]
+    fn sentinelone_process_kill_is_unsupported_never_downgraded() {
+        for dir in [ActionDirection::Apply, ActionDirection::Reverse] {
+            let err = sentinelone_action_path(ActionType::ProcessKill, dir)
+                .expect_err("PROCESS_KILL must not map to any SentinelOne action");
+            assert!(
+                matches!(
+                    err,
+                    EdrError::Unsupported {
+                        action: ActionType::ProcessKill,
+                        provider: "sentinelone",
+                        ..
+                    }
+                ),
+                "expected Unsupported, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn crowdstrike_process_kill_fails_before_any_edr_call() {
+        // The credential points at an unreachable address: if the client
+        // attempted ANY network call (even the token fetch) we would see a
+        // Transport error. Getting Unsupported proves the dispatch failed
+        // loudly before a single byte left the proxy.
+        let fallback = EdrClient::Noop;
+        let creds = cs_creds();
+        let err = dispatch(
+            &fallback,
+            Some(&creds),
+            ActionType::ProcessKill,
+            ActionDirection::Apply,
+            "device-1",
+        )
+        .await
+        .expect_err("PROCESS_KILL on CrowdStrike must fail");
+        assert!(
+            matches!(err, EdrError::Unsupported { .. }),
+            "expected Unsupported (no call attempted), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sentinelone_process_kill_fails_before_any_edr_call() {
+        let fallback = EdrClient::Noop;
+        let creds = EdrCredentials {
+            provider: EdrProvider::Sentinelone,
+            api_key: String::new(),
+            api_secret: Some("tok".to_string()),
+            base_url: Some("http://127.0.0.1:1".to_string()),
+        };
+        let err = dispatch(
+            &fallback,
+            Some(&creds),
+            ActionType::ProcessKill,
+            ActionDirection::Apply,
+            "agent-1",
+        )
+        .await
+        .expect_err("PROCESS_KILL on SentinelOne must fail");
+        assert!(
+            matches!(err, EdrError::Unsupported { .. }),
+            "expected Unsupported (no call attempted), got {err:?}"
         );
     }
 
@@ -750,5 +1035,109 @@ mod tests {
         .await
         .expect_err("S1 with no base_url must be Misconfigured");
         assert!(matches!(err, EdrError::Misconfigured(_)));
+    }
+
+    // ── SentinelOne endpoint-level test against a loopback mock ────────
+    //
+    // Proves the S1 client hits the CORRECT agents-action endpoint for
+    // each supported action type and direction, and that an unsupported
+    // action produces zero calls.
+
+    use std::net::SocketAddr;
+    use std::sync::Mutex as StdMutex;
+
+    /// Start a SentinelOne-shaped mock recording every action path hit.
+    async fn spawn_mock_s1() -> (String, Arc<StdMutex<Vec<String>>>) {
+        use axum::extract::{Path, State};
+        use axum::response::Json;
+        use axum::Router;
+
+        let hits: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+
+        async fn agents_action(
+            State(hits): State<Arc<StdMutex<Vec<String>>>>,
+            Path(action): Path<String>,
+        ) -> Json<serde_json::Value> {
+            hits.lock().expect("mock s1 state poisoned").push(action);
+            Json(serde_json::json!({"data": {"affected": 1}}))
+        }
+
+        let app = Router::new()
+            .route(
+                "/web/api/v2.1/agents/actions/:action",
+                axum::routing::post(agents_action),
+            )
+            .with_state(hits.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock s1");
+        let addr: SocketAddr = listener.local_addr().expect("mock s1 addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock s1 serve");
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    #[tokio::test]
+    async fn sentinelone_hits_correct_endpoint_per_action_and_direction() {
+        let (base_url, hits) = spawn_mock_s1().await;
+        let fallback = EdrClient::Noop;
+        let creds = EdrCredentials {
+            provider: EdrProvider::Sentinelone,
+            api_key: String::new(),
+            api_secret: Some("tok".to_string()),
+            base_url: Some(base_url),
+        };
+
+        // Isolation: disconnect on apply, connect on rollback.
+        dispatch(
+            &fallback,
+            Some(&creds),
+            ActionType::HostIsolation,
+            ActionDirection::Apply,
+            "agent-1",
+        )
+        .await
+        .expect("isolation apply");
+        dispatch(
+            &fallback,
+            Some(&creds),
+            ActionType::HostIsolation,
+            ActionDirection::Reverse,
+            "agent-1",
+        )
+        .await
+        .expect("isolation rollback");
+
+        // Network quarantine: the same S1 primitive, honestly.
+        dispatch(
+            &fallback,
+            Some(&creds),
+            ActionType::NetworkQuarantine,
+            ActionDirection::Apply,
+            "agent-1",
+        )
+        .await
+        .expect("quarantine apply");
+
+        // Process kill: unsupported, must NOT add a hit.
+        let err = dispatch(
+            &fallback,
+            Some(&creds),
+            ActionType::ProcessKill,
+            ActionDirection::Apply,
+            "agent-1",
+        )
+        .await
+        .expect_err("process kill must fail loudly");
+        assert!(matches!(err, EdrError::Unsupported { .. }));
+
+        let recorded = hits.lock().expect("mock s1 state poisoned").clone();
+        assert_eq!(
+            recorded,
+            vec!["disconnect", "connect", "disconnect"],
+            "S1 must receive exactly the approved actions, in order, and nothing for PROCESS_KILL"
+        );
     }
 }

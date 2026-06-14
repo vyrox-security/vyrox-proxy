@@ -29,7 +29,7 @@
 //!   "action_type": "HOST_ISOLATION",
 //!   "host": "workstation-01",
 //!   "approved_by": "analyst@company.com",
-//!   "dry_run": false,
+//!   "simulated": false,
 //!   "previous_hash": "0000...0000",
 //!   "hash": "e3b0c4..."
 //! }
@@ -58,8 +58,8 @@ use std::sync::Arc;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 /// Sentinel value used as `previous_hash` for the first entry in a
@@ -91,8 +91,13 @@ pub struct AuditEntry {
     /// Discord username who approved this action.
     pub approved_by: String,
 
-    /// Whether this was a dry-run.
-    pub dry_run: bool,
+    /// Honesty label recording that the action targeted a demo/mock fleet
+    /// rather than a real customer EDR. Set from the tenant's `is_demo` flag
+    /// on the Python side and carried inside the signed request body. It is a
+    /// label ONLY: the proxy still performs the real EDR call (which, for a
+    /// demo tenant, lands on the bundled mock EDR), so this records WHAT was
+    /// targeted, not WHETHER an action ran.
+    pub simulated: bool,
 
     /// SHA-256 hash of the previous entry (or `GENESIS_HASH` for
     /// the very first entry). Together with `hash` this forms the
@@ -223,7 +228,7 @@ pub fn build_entry(
     action_type: String,
     host: String,
     approved_by: String,
-    dry_run: bool,
+    simulated: bool,
 ) -> AuditEntry {
     AuditEntry {
         timestamp: Utc::now().timestamp(),
@@ -231,18 +236,22 @@ pub fn build_entry(
         action_type,
         host,
         approved_by,
-        dry_run,
+        simulated,
         previous_hash: GENESIS_HASH.to_string(),
         hash: String::new(),
     }
 }
 
-/// Read and parse audit log entries from file.
+/// Read and parse ALL audit log entries from file into memory.
 ///
-/// Used by `GET /audit/export`. Silently skips malformed lines so a
-/// single bad entry does not block the whole file from being read.
-/// Returns an empty vec if the file does not exist (the request
-/// authenticated successfully but the tenant has no history yet).
+/// Silently skips malformed lines so a single bad entry does not block the
+/// whole file from being read. Returns an empty vec if the file does not exist.
+///
+/// This loads the entire file into RAM. The `GET /audit/export` path uses the
+/// streaming, tenant-filtered `read_tenant_entries_streaming` instead (PRX-04)
+/// so file-size x concurrent exports cannot become an unbounded-memory
+/// amplifier. This whole-file reader stays for the tests and the chain-seed
+/// helper, where the input is small and bounded.
 pub async fn read_audit_logs(path: &str) -> Result<Vec<AuditEntry>, std::io::Error> {
     let content = match tokio::fs::read_to_string(path).await {
         Ok(c) => c,
@@ -257,6 +266,44 @@ pub async fn read_audit_logs(path: &str) -> Result<Vec<AuditEntry>, std::io::Err
         }
         if let Ok(entry) = serde_json::from_str::<AuditEntry>(line) {
             entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+/// Stream the audit log line-by-line, returning only the entries for one
+/// tenant (PRX-04).
+///
+/// Unlike `read_audit_logs`, this never holds the whole file in memory: it
+/// reads one line at a time through a `BufReader` and keeps only the entries
+/// whose `tenant_id` matches. Peak memory is one line plus the filtered result,
+/// not the full file, so a large log and many concurrent `/audit/export` calls
+/// no longer multiply into an unbounded-memory amplifier. (The matched result
+/// is still materialised because the endpoint returns a JSON array; a tenant's
+/// own slice is bounded by that tenant's history, not by the global file.)
+///
+/// Malformed lines are skipped, mirroring `read_audit_logs`. A missing file
+/// yields an empty vec (authenticated request, tenant has no history yet).
+pub async fn read_tenant_entries_streaming(
+    path: &str,
+    tenant_id: &str,
+) -> Result<Vec<AuditEntry>, std::io::Error> {
+    let file = match File::open(path).await {
+        Ok(f) => f,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+
+    let mut lines = BufReader::new(file).lines();
+    let mut entries = Vec::new();
+    while let Some(line) = lines.next_line().await? {
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<AuditEntry>(&line) {
+            if entry.tenant_id == tenant_id {
+                entries.push(entry);
+            }
         }
     }
     Ok(entries)
@@ -284,27 +331,58 @@ pub async fn read_last_hash(path: &str) -> Result<String, std::io::Error> {
 /// of this function and cannot participate in its own input). Using
 /// canonical JSON makes the hash reproducible byte-for-byte across
 /// platforms and across the Python / Rust split.
+///
+/// ## Canonical form (must match `shared/audit.py` EXACTLY)
+///
+/// The tamper-evident chain only cross-verifies if both languages hash the
+/// same bytes. The spec, pinned by the cross-language fixture test below:
+///
+/// - keys sorted ascending by Unicode code point,
+/// - compact separators (`,` and `:`, no spaces),
+/// - UTF-8, non-ASCII NOT escaped (`é` is the two raw bytes `0xC3 0xA9`,
+///   never `é`).
+///
+/// We build the payload from a `BTreeMap`, which guarantees the sorted-key
+/// ordering by construction rather than by hand-written field order. The
+/// previous code used `serde_json::json!{}` (an insertion-ordered Map), so the
+/// canonical form rested on the author keeping the literal alphabetical, one
+/// reorder away from silently diverging the two chains (PRX-02). `serde_json`'s
+/// default compact serializer already emits raw UTF-8 (it does not escape
+/// non-ASCII), so the spec holds without any extra flags. The cross-language
+/// fixture `canonical_hash_matches_python_fixture` is the regression guard.
 fn compute_entry_hash(entry: &AuditEntry) -> String {
-    // We serialise a manual struct so we can control field ordering
-    // independently of the `Serialize` derive on `AuditEntry`.
-    // `serde_json` already sorts keys alphabetically when given a
-    // BTreeMap, but constructing one inline keeps the code obvious.
-    let payload = serde_json::json!({
-        "action_type": entry.action_type,
-        "approved_by": entry.approved_by,
-        "dry_run": entry.dry_run,
-        "host": entry.host,
-        "previous_hash": entry.previous_hash,
-        "tenant_id": entry.tenant_id,
-        "timestamp": entry.timestamp,
-    });
-    let canonical = serde_json::to_vec(&payload).expect("payload always serialises");
+    let canonical = canonical_payload_bytes(entry);
 
     let mut hasher = Sha256::new();
     hasher.update(entry.previous_hash.as_bytes());
     hasher.update(b"|");
     hasher.update(&canonical);
     hex::encode(hasher.finalize())
+}
+
+/// Serialize an entry's payload fields into the canonical byte form the hash
+/// is computed over: every field except `hash`, keys sorted ascending by code
+/// point, compact separators, raw UTF-8.
+///
+/// Factored out so the canonical-form spec lives in one place and the
+/// cross-language fixture test can exercise the exact serializer the hash uses.
+/// A `BTreeMap` enforces the sorted-key ordering by type, not by discipline.
+fn canonical_payload_bytes(entry: &AuditEntry) -> Vec<u8> {
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+
+    let mut payload: BTreeMap<String, Value> = BTreeMap::new();
+    payload.insert("action_type".into(), Value::from(entry.action_type.clone()));
+    payload.insert("approved_by".into(), Value::from(entry.approved_by.clone()));
+    payload.insert("host".into(), Value::from(entry.host.clone()));
+    payload.insert(
+        "previous_hash".into(),
+        Value::from(entry.previous_hash.clone()),
+    );
+    payload.insert("simulated".into(), Value::from(entry.simulated));
+    payload.insert("tenant_id".into(), Value::from(entry.tenant_id.clone()));
+    payload.insert("timestamp".into(), Value::from(entry.timestamp));
+    serde_json::to_vec(&payload).expect("payload always serialises")
 }
 
 #[cfg(test)]
@@ -395,6 +473,165 @@ mod tests {
         let entries = read_audit_logs(&path).await.expect("read");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[1].previous_hash, saved_hash);
+    }
+
+    /// Cross-language canonical-serializer fixture (PRX-02, theme 2).
+    ///
+    /// The Rust and Python audit chains are only cross-verifiable, the core
+    /// tamper-evidence claim, if both hash the same canonical bytes. This pins
+    /// the exact serializer to the spec: keys sorted ascending by code point,
+    /// compact separators (`,`/`:`, no spaces), raw UTF-8 (non-ASCII NOT
+    /// escaped). The constant is asserted by the Python side too, so if either
+    /// serializer drifts, this test (and its Python twin) goes red.
+    ///
+    /// Input `{"a":"x","m":1,"z":"é"}` must serialise to the exact bytes
+    /// `{"a":"x","m":1,"z":"é"}` (with `é` as the two UTF-8 bytes 0xC3 0xA9,
+    /// not the escape `é`), whose sha256 is the constant below.
+    #[test]
+    fn canonical_hash_matches_python_fixture() {
+        use serde_json::Value;
+        use std::collections::BTreeMap;
+
+        let mut payload: BTreeMap<String, Value> = BTreeMap::new();
+        // Insert OUT of order on purpose: the BTreeMap must sort them.
+        payload.insert("z".into(), Value::from("é"));
+        payload.insert("a".into(), Value::from("x"));
+        payload.insert("m".into(), Value::from(1));
+
+        let bytes = serde_json::to_vec(&payload).expect("serialise fixture");
+
+        // Byte-exact canonical form: sorted keys, compact, raw UTF-8 (é is the
+        // two bytes 0xC3 0xA9, never an escaped é).
+        assert_eq!(
+            bytes, b"{\"a\":\"x\",\"m\":1,\"z\":\"\xc3\xa9\"}",
+            "canonical bytes must match the Python ensure_ascii=False sort_keys form"
+        );
+
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let digest = hex::encode(hasher.finalize());
+        assert_eq!(
+            digest, "766b45d54caad1b76f358687b74b45108a81ea40f94cfa6d048eb1efd77583e9",
+            "canonical sha256 must equal the constant the Python audit chain asserts"
+        );
+    }
+
+    /// The entry payload serializer (the one the chain hash covers) must emit
+    /// sorted keys, the `simulated` field, and raw non-ASCII bytes. Guards the
+    /// dry_run->simulated rename and the BTreeMap canonicalisation together.
+    #[test]
+    fn canonical_payload_is_sorted_compact_and_uses_simulated() {
+        let mut entry = build_entry(
+            "tén".into(),
+            "HostIsolation".into(),
+            "host-é".into(),
+            "alice".into(),
+            true,
+        );
+        entry.timestamp = 1_700_000_000;
+        entry.previous_hash = GENESIS_HASH.to_string();
+
+        let bytes = canonical_payload_bytes(&entry);
+        let text = String::from_utf8(bytes.clone()).expect("utf-8");
+
+        // Compact (no spaces after separators) and key-sorted: action_type,
+        // approved_by, host, previous_hash, simulated, tenant_id, timestamp.
+        assert!(
+            text.starts_with("{\"action_type\":"),
+            "first key sorted: {text}"
+        );
+        assert!(
+            text.contains("\"simulated\":true"),
+            "uses simulated, not dry_run"
+        );
+        assert!(!text.contains("dry_run"), "old field name must be gone");
+        assert!(!text.contains(": "), "compact separators, no spaces");
+        // Raw UTF-8, not escaped: the é in host-é stays two bytes, not é.
+        assert!(text.contains("host-é"), "non-ASCII must not be escaped");
+        assert!(!text.contains("\\u00e9"), "non-ASCII must not be escaped");
+    }
+
+    #[tokio::test]
+    async fn streaming_export_filters_by_tenant_and_skips_other_tenants() {
+        // PRX-04: the streaming reader must return only the requested tenant's
+        // entries (tenant isolation enforced in the read, not after) and must
+        // not choke on a malformed line. Also covers the missing-file path.
+        let tmp = NamedTempFile::new().expect("tmp");
+        let path = tmp.path().to_str().unwrap().to_string();
+        let state = ChainState::genesis();
+
+        append_audit(
+            &path,
+            &state,
+            build_entry(
+                "t1".into(),
+                "HostIsolation".into(),
+                "h-1".into(),
+                "a".into(),
+                false,
+            ),
+        )
+        .await
+        .expect("t1 entry");
+        append_audit(
+            &path,
+            &state,
+            build_entry(
+                "t2".into(),
+                "HostIsolation".into(),
+                "h-2".into(),
+                "b".into(),
+                true,
+            ),
+        )
+        .await
+        .expect("t2 entry");
+        // A malformed line in the middle must be skipped, not abort the read.
+        {
+            use tokio::io::AsyncWriteExt as _;
+            let mut f = OpenOptions::new().append(true).open(&path).await.unwrap();
+            f.write_all(b"{ not valid json\n").await.unwrap();
+            f.flush().await.unwrap();
+        }
+        append_audit(
+            &path,
+            &state,
+            build_entry(
+                "t1".into(),
+                "HostIsolation".into(),
+                "h-3".into(),
+                "c".into(),
+                false,
+            ),
+        )
+        .await
+        .expect("second t1 entry");
+
+        let t1 = read_tenant_entries_streaming(&path, "t1")
+            .await
+            .expect("t1 read");
+        assert_eq!(t1.len(), 2, "only t1 entries, malformed line skipped");
+        assert!(t1.iter().all(|e| e.tenant_id == "t1"));
+
+        let t2 = read_tenant_entries_streaming(&path, "t2")
+            .await
+            .expect("t2 read");
+        assert_eq!(t2.len(), 1);
+        assert!(
+            t2[0].simulated,
+            "t2 entry carried simulated=true through the read"
+        );
+
+        // No history for an unknown tenant, and a missing file is empty, not an
+        // error.
+        let none = read_tenant_entries_streaming(&path, "nope")
+            .await
+            .expect("empty");
+        assert!(none.is_empty());
+        let missing = read_tenant_entries_streaming("/nonexistent/audit.jsonl", "t1")
+            .await
+            .expect("missing file is empty, not an error");
+        assert!(missing.is_empty());
     }
 
     #[tokio::test]
