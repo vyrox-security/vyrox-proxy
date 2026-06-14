@@ -267,7 +267,7 @@ impl NonceStore {
     ///   it is non-empty.
     pub async fn claim_or_replay(&self, request_id: &str) -> Result<Outcome, redis::RedisError> {
         match &self.backend {
-            Backend::Memory(map) => Ok(claim_memory(map, request_id)),
+            Backend::Memory(map) => Ok(claim_memory(map, request_id, self.ttl_seconds)),
             Backend::Redis(manager) => {
                 claim_redis(manager.clone(), request_id, self.ttl_seconds).await
             }
@@ -445,12 +445,12 @@ enum RecordState {
 
 /// Atomic claim-or-replay against the in-memory map. `DashMap::entry` makes the
 /// check-and-insert atomic per shard.
-fn claim_memory(map: &Arc<DashMap<String, Record>>, request_id: &str) -> Outcome {
+fn claim_memory(map: &Arc<DashMap<String, Record>>, request_id: &str, ttl_seconds: u64) -> Outcome {
     // Run eviction opportunistically on the claim path so memory is reclaimed
     // even with no background task. Only triggered at/above the cap to amortize
     // the cost.
     if map.len() >= MAX_RECORDS {
-        evict_expired(map);
+        evict_expired(map, ttl_seconds);
         // TTL eviction alone does NOT bound memory: an adversary (or a genuine
         // storm) sending > MAX_RECORDS unique request_ids inside the retention
         // window leaves every record younger than the cutoff, so `evict_expired`
@@ -491,9 +491,9 @@ fn record_memory(map: &Arc<DashMap<String, Record>>, request_id: &str, response_
     }
 }
 
-/// Drop records whose `created_at` is older than the retention window.
-fn evict_expired(map: &Arc<DashMap<String, Record>>) {
-    let cutoff = Duration::from_secs(DEFAULT_RETENTION_SECONDS);
+/// Drop records whose `created_at` is older than the configured retention window.
+fn evict_expired(map: &Arc<DashMap<String, Record>>, ttl_seconds: u64) {
+    let cutoff = Duration::from_secs(ttl_seconds);
     map.retain(|_, record| record.created_at.elapsed() < cutoff);
 }
 

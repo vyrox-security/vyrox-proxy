@@ -5,6 +5,7 @@ target/
 .env
 .env.*
 audit.jsonl
+/audit
 *.log
 
 # Cargo generated
