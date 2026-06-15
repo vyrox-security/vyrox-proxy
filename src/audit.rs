@@ -185,6 +185,19 @@ pub async fn append_audit(
     state: &ChainState,
     mut entry: AuditEntry,
 ) -> Result<(), std::io::Error> {
+    // Open OUTSIDE the chain lock. `create(true).append(true)` opens for append
+    // and creates the file if absent; the kernel-honoured append flag means two
+    // appenders cannot stomp each other. Opening here rather than inside the
+    // lock keeps a slow open() off the critical section, so it never serializes
+    // one tenant's containment behind another's (T72). The chain link + write +
+    // fsync below stay under the lock, so the on-disk order still matches the
+    // chain order.
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+
     let mut guard = state.inner.lock().await;
 
     // Stamp the chain link before computing the hash so the hash
@@ -197,15 +210,6 @@ pub async fn append_audit(
 
     let line = serde_json::to_string(&entry)
         .map_err(|err| std::io::Error::other(format!("serialize entry: {err}")))?;
-
-    // `create(true).append(true)` opens for append and creates the
-    // file if it does not exist. The `append` flag is honoured by
-    // the kernel, so two appenders cannot stomp each other.
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await?;
 
     file.write_all(line.as_bytes()).await?;
     file.write_all(b"\n").await?;
