@@ -72,19 +72,43 @@
 //! so a retry can run on fresh state.
 
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::actions::{ActionDirection, ActionType};
 
 /// Default HTTP timeout for EDR calls, in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+/// Process-wide CrowdStrike OAuth bearer cache, keyed by credential identity
+/// (PRX-07).
+///
+/// The per-tenant dispatch path builds a fresh `CrowdstrikeClient` for every
+/// request (so tenant A always acts with tenant A's key), which meant the old
+/// per-instance token cache never survived a single request: every action paid
+/// a full OAuth round-trip. This shared cache lives for the life of the process
+/// and is keyed by a stable, non-secret identity (`base_url` + `client_id` + a
+/// hash of the secret), so consecutive actions for the same tenant reuse a valid
+/// bearer instead of re-authenticating.
+///
+/// Keying on a credential identity rather than per-client keeps tenants
+/// isolated: tenant A's entry can never serve tenant B a token, and a rotated
+/// secret produces a different key (the old entry simply expires out). The
+/// cached value is a short-lived bearer + a refresh deadline; secrets are never
+/// stored as map keys (only a hash) and the cache is never logged.
+static CROWDSTRIKE_TOKEN_CACHE: OnceLock<DashMap<String, CachedToken>> = OnceLock::new();
+
+/// Accessor for the lazily-initialised shared token cache.
+fn token_cache() -> &'static DashMap<String, CachedToken> {
+    CROWDSTRIKE_TOKEN_CACHE.get_or_init(DashMap::new)
+}
 
 /// Errors that can happen during an EDR dispatch.
 ///
@@ -105,8 +129,19 @@ pub enum EdrError {
     #[error("edr returned server error {status}: {body}")]
     ServerError { status: u16, body: String },
 
-    /// Transport error (DNS, TCP, TLS, timeout).
-    #[error("edr transport error: {0}")]
+    /// Transport error that definitively happened BEFORE the request bytes
+    /// reached the EDR: connection refused, DNS failure, TLS handshake failure.
+    /// The side effect provably did NOT happen, so the caller can safely
+    /// release the nonce and allow a clean retry (CNT-05 / T63).
+    #[error("edr transport error (pre-send): {0}")]
+    TransportPreSend(String),
+
+    /// Transport error that is AMBIGUOUS about whether the EDR acted: a timeout
+    /// after the request was sent, a dropped/lost response, a body-read error.
+    /// The action MAY have executed, so the caller must NOT release the nonce
+    /// (releasing would let a retry double-execute the containment). Surfaced
+    /// as a needs-reconciliation state instead (CNT-05 / T63).
+    #[error("edr transport error (ambiguous, may have executed): {0}")]
     Transport(String),
 
     /// EDR returned a successful HTTP status but the response body
@@ -131,6 +166,56 @@ pub enum EdrError {
         provider: &'static str,
         detail: &'static str,
     },
+}
+
+impl EdrError {
+    /// True when this error proves the EDR side effect did NOT happen, so the
+    /// caller may safely release the nonce and allow a clean retry (CNT-05).
+    ///
+    /// Only `TransportPreSend` (connection refused, DNS, TLS handshake) and a
+    /// pre-send config failure (`Misconfigured`, `Unsupported`) qualify: in all
+    /// of those no request bytes reached the EDR. `Transport` (ambiguous), a
+    /// 4xx/5xx the EDR returned, and an unexpected response all leave open the
+    /// possibility the action executed, so they are NOT release-safe.
+    ///
+    /// `Misconfigured`/`Unsupported` are listed here for completeness, but the
+    /// handler short-circuits both before dispatch, so in practice only the two
+    /// transport variants drive the release decision at the dispatch boundary.
+    pub fn side_effect_definitely_did_not_happen(&self) -> bool {
+        matches!(
+            self,
+            EdrError::TransportPreSend(_)
+                | EdrError::Misconfigured(_)
+                | EdrError::Unsupported { .. }
+        )
+    }
+}
+
+/// Classify a reqwest error from a `.send()` call into a pre-send (safe to
+/// release the nonce) or ambiguous (the action may have executed) transport
+/// error (CNT-05 / T63).
+///
+/// The distinction is which side of "the request reached the EDR" the failure
+/// fell on:
+///
+/// - `is_connect()` means the TCP/TLS connection was never established, so the
+///   request bytes never left for the EDR. Provably no side effect: pre-send.
+/// - A timeout (`is_timeout()`), a lost/dropped response, or a body-read error
+///   can all fire AFTER the request was written to the socket, when the EDR may
+///   already have applied the action. Ambiguous: we must not release the nonce.
+///
+/// reqwest collapses DNS resolution failures into the connect phase, so they
+/// land in `is_connect()` and are correctly treated as pre-send. We bias the
+/// unknown/uncategorised case toward ambiguous (the conservative direction): a
+/// misclassified ambiguous error costs a human reconciliation, while a
+/// misclassified pre-send error costs a double-execute, which is the outcome
+/// this whole change exists to prevent.
+fn classify_transport_error(err: &reqwest::Error) -> EdrError {
+    if err.is_connect() {
+        EdrError::TransportPreSend(err.to_string())
+    } else {
+        EdrError::Transport(err.to_string())
+    }
 }
 
 /// Which EDR a per-tenant credential targets.
@@ -373,16 +458,21 @@ pub fn check_supported(
 
 /// CrowdStrike Falcon Real Time Response client.
 ///
-/// Holds a `reqwest::Client` and a mutex-guarded token cache. We use a
-/// single Mutex around the cache (rather than per-field locks) because
-/// the critical section is microseconds long and contention is bounded
-/// by request rate (low for human-approved actions).
+/// Holds a `reqwest::Client` and a `cache_key` into the process-wide
+/// `CROWDSTRIKE_TOKEN_CACHE` (PRX-07). The token cache is shared across requests
+/// rather than per-instance, because the per-tenant dispatch path builds a fresh
+/// client per request: a per-instance cache would be discarded immediately and
+/// every action would re-authenticate. Keying the shared cache by credential
+/// identity reuses a valid bearer across a tenant's consecutive actions while
+/// keeping tenants isolated.
 pub struct CrowdstrikeClient {
     http: Client,
     base_url: String,
     client_id: String,
     client_secret: String,
-    token: Mutex<Option<CachedToken>>,
+    /// Stable, non-secret key into the shared token cache. Derived from
+    /// `base_url` + `client_id` + a hash of the secret (see `token_cache_key`).
+    cache_key: String,
 }
 
 #[derive(Clone)]
@@ -390,6 +480,20 @@ struct CachedToken {
     bearer: String,
     /// Refresh when `Instant::now()` >= this value.
     refresh_at: Instant,
+}
+
+/// Build the shared-cache key for a CrowdStrike credential.
+///
+/// Combines `base_url` and `client_id` (the credential's identity) with a
+/// SHA-256 hash of the secret, so a rotated secret keys to a different entry
+/// (the stale token is never reused) without ever putting the plaintext secret
+/// in a map key. Two requests for the same tenant credential produce the same
+/// key and therefore share a bearer.
+fn token_cache_key(base_url: &str, client_id: &str, client_secret: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(client_secret.as_bytes());
+    let secret_hash = hex::encode(hasher.finalize());
+    format!("{base_url}\u{0}{client_id}\u{0}{secret_hash}")
 }
 
 /// Shape of the OAuth2 token response from
@@ -432,26 +536,33 @@ impl CrowdstrikeClient {
             .build()
             .map_err(|e| EdrError::Misconfigured(format!("http client build failed: {e}")))?;
 
+        let cache_key = token_cache_key(&base_url, &client_id, &client_secret);
         Ok(Self {
             http,
             base_url,
             client_id,
             client_secret,
-            token: Mutex::new(None),
+            cache_key,
         })
     }
 
     /// Get a bearer token, refreshing if necessary.
     ///
-    /// Concurrency: only one task can hold the lock at a time, so
-    /// concurrent first-callers serialize on the token fetch. After the
-    /// first fetch, all callers within the cache window get the cached value
-    /// without re-fetching. A per-request client (the per-tenant path) lives
-    /// for one action, so it fetches once and is dropped.
+    /// Reads from and writes to the process-wide `CROWDSTRIKE_TOKEN_CACHE`
+    /// (PRX-07), keyed by `self.cache_key` (credential identity). Consecutive
+    /// actions for the same tenant therefore reuse a valid bearer across
+    /// requests, even though each per-tenant request builds a fresh client. A
+    /// cache hit returns with zero network calls; a miss or expired entry
+    /// fetches once and writes the new token back for the next request.
+    ///
+    /// Concurrency: a brief race where two first-callers both miss the cache and
+    /// both fetch is harmless, both write a valid bearer and the last writer
+    /// wins. We do not hold a lock across the network fetch (DashMap entries are
+    /// not held across the await), so a slow CrowdStrike never serializes every
+    /// other tenant's token fetch behind it.
     async fn bearer_token(&self) -> Result<String, EdrError> {
-        let mut guard = self.token.lock().await;
-
-        if let Some(cached) = guard.as_ref() {
+        // Fast path: a live cached bearer for this exact credential identity.
+        if let Some(cached) = token_cache().get(&self.cache_key) {
             if Instant::now() < cached.refresh_at {
                 return Ok(cached.bearer.clone());
             }
@@ -459,6 +570,12 @@ impl CrowdstrikeClient {
 
         // Need a fresh token.
         let url = format!("{}/oauth2/token", self.base_url);
+        // A failed token fetch is ALWAYS release-safe regardless of pre/post
+        // send: the containment device-action call is never made without a
+        // bearer, so the action provably did not happen. We classify a connect
+        // failure as pre-send and map any other token-fetch transport error to
+        // pre-send too, because the only side effect that matters (the action)
+        // could not have run. The token endpoint itself is read-only.
         let resp = self
             .http
             .post(&url)
@@ -468,7 +585,7 @@ impl CrowdstrikeClient {
             ])
             .send()
             .await
-            .map_err(|e| EdrError::Transport(e.to_string()))?;
+            .map_err(|e| EdrError::TransportPreSend(e.to_string()))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -488,11 +605,13 @@ impl CrowdstrikeClient {
         // CrowdStrike, and to avoid the cliff where the token expires
         // mid-flight.
         let lifetime = Duration::from_secs((parsed.expires_in * 8) / 10);
-        let new = CachedToken {
-            bearer: parsed.access_token.clone(),
-            refresh_at: Instant::now() + lifetime,
-        };
-        *guard = Some(new);
+        token_cache().insert(
+            self.cache_key.clone(),
+            CachedToken {
+                bearer: parsed.access_token.clone(),
+                refresh_at: Instant::now() + lifetime,
+            },
+        );
 
         Ok(parsed.access_token)
     }
@@ -524,6 +643,12 @@ impl CrowdstrikeClient {
             ids: vec![host],
         };
 
+        // This is THE side-effecting call. Classify a transport failure here as
+        // pre-send (connection refused / DNS: the action never left) vs
+        // ambiguous (timeout after send / lost response: the action may have
+        // run). The nonce-release decision in the handler keys off that
+        // distinction so an ambiguous failure never lets a retry double-isolate
+        // a host (CNT-05 / T63).
         let resp = self
             .http
             .post(&url)
@@ -531,7 +656,7 @@ impl CrowdstrikeClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| EdrError::Transport(e.to_string()))?;
+            .map_err(|e| classify_transport_error(&e))?;
 
         let status = resp.status();
         if status.is_success() {
@@ -653,6 +778,9 @@ impl SentinelOneClient {
             filter: S1Filter { uuids: vec![host] },
         };
 
+        // THE side-effecting call. Same pre-send vs ambiguous classification as
+        // CrowdStrike so the handler's nonce-release decision is correct for S1
+        // too (CNT-05 / T63).
         let resp = self
             .http
             .post(&url)
@@ -660,7 +788,7 @@ impl SentinelOneClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| EdrError::Transport(e.to_string()))?;
+            .map_err(|e| classify_transport_error(&e))?;
 
         let status = resp.status();
         if status.is_success() {
@@ -981,6 +1109,10 @@ mod tests {
         // points CrowdStrike at an unreachable base_url, so a transport
         // error proves the per-tenant client ran INSTEAD of the noop
         // fallback. If the fallback had been used we would get Ok.
+        //
+        // The failure is a connection refused on the OAuth token fetch, i.e. a
+        // pre-send transport error: no device-action call was ever made, so the
+        // action provably did not happen and the nonce is release-safe (CNT-05).
         let fallback = EdrClient::Noop;
         let creds = cs_creds();
         let err = dispatch(
@@ -993,9 +1125,86 @@ mod tests {
         .await
         .expect_err("per-tenant CrowdStrike client should attempt a real call and fail transport");
         assert!(
-            matches!(err, EdrError::Transport(_)),
-            "expected transport error from per-tenant client, got {err:?}"
+            matches!(err, EdrError::TransportPreSend(_)),
+            "expected a pre-send transport error from per-tenant client, got {err:?}"
         );
+        assert!(
+            err.side_effect_definitely_did_not_happen(),
+            "connection refused before the action call means the side effect did not happen"
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_connect_failure_is_pre_send_and_release_safe() {
+        // A connection refused (nothing listening) is reqwest::Error::is_connect:
+        // the request bytes never left, so it must classify as pre-send and be
+        // release-safe (CNT-05 / T63). We provoke a genuine connect failure by
+        // posting to a closed loopback port with the async client.
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let err = client
+            .post("http://127.0.0.1:1/oauth2/token")
+            .send()
+            .await
+            .expect_err("connection to a closed port must fail");
+        assert!(
+            err.is_connect(),
+            "sanity: a closed-port failure should be a connect error, got {err:?}"
+        );
+        let classified = classify_transport_error(&err);
+        assert!(
+            matches!(classified, EdrError::TransportPreSend(_)),
+            "a connect failure must classify as pre-send, got {classified:?}"
+        );
+        assert!(
+            classified.side_effect_definitely_did_not_happen(),
+            "a pre-send transport error must be release-safe"
+        );
+    }
+
+    #[test]
+    fn ambiguous_transport_is_not_release_safe() {
+        // An ambiguous transport error (timeout after send / lost response) MUST
+        // NOT be release-safe: the action may have executed, so releasing the
+        // nonce would let a retry double-execute (CNT-05 / T63).
+        let err = EdrError::Transport("timed out reading response".to_string());
+        assert!(
+            !err.side_effect_definitely_did_not_happen(),
+            "an ambiguous transport error must not be treated as release-safe"
+        );
+    }
+
+    #[test]
+    fn server_and_client_errors_are_not_release_safe() {
+        // A 4xx/5xx the EDR returned means it WAS contacted; the action may have
+        // taken effect even on a 5xx. Neither is release-safe.
+        let server = EdrError::ServerError {
+            status: 503,
+            body: String::new(),
+        };
+        let client_err = EdrError::ClientError {
+            status: 429,
+            body: String::new(),
+        };
+        assert!(!server.side_effect_definitely_did_not_happen());
+        assert!(!client_err.side_effect_definitely_did_not_happen());
+    }
+
+    #[test]
+    fn unsupported_and_misconfigured_are_release_safe_pre_dispatch() {
+        // Both are decided before any network call, so they are release-safe by
+        // construction (the handler short-circuits Unsupported separately, but
+        // the predicate must still report the truth).
+        let unsupported = EdrError::Unsupported {
+            action: ActionType::ProcessKill,
+            provider: "crowdstrike",
+            detail: "no mapping",
+        };
+        let misconfigured = EdrError::Misconfigured("no base_url".to_string());
+        assert!(unsupported.side_effect_definitely_did_not_happen());
+        assert!(misconfigured.side_effect_definitely_did_not_happen());
     }
 
     #[tokio::test]
@@ -1138,6 +1347,159 @@ mod tests {
             recorded,
             vec!["disconnect", "connect", "disconnect"],
             "S1 must receive exactly the approved actions, in order, and nothing for PROCESS_KILL"
+        );
+    }
+
+    // ── CrowdStrike token cache (PRX-07) ───────────────────────────────────
+    //
+    // The shared `CROWDSTRIKE_TOKEN_CACHE` must let consecutive actions for the
+    // same tenant credential reuse a bearer ACROSS requests, even though each
+    // per-tenant request builds a fresh CrowdstrikeClient. A different
+    // credential must NOT reuse another's token.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A CrowdStrike-shaped mock that counts how many times `/oauth2/token` is
+    /// hit, so a test can prove the second action reused the cached bearer
+    /// instead of re-authenticating.
+    async fn spawn_counting_mock_crowdstrike() -> (String, Arc<AtomicUsize>) {
+        use axum::extract::State;
+        use axum::response::Json;
+        use axum::Router;
+
+        let token_hits = Arc::new(AtomicUsize::new(0));
+
+        async fn token(State(hits): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            hits.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "access_token": "mock-bearer",
+                "token_type": "bearer",
+                "expires_in": 1800,
+            }))
+        }
+
+        async fn device_action() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "resources": [], "errors": [] }))
+        }
+
+        let app = Router::new()
+            .route("/oauth2/token", axum::routing::post(token))
+            .route(
+                "/devices/entities/devices-actions/v2",
+                axum::routing::post(device_action),
+            )
+            .with_state(token_hits.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock cs");
+        let addr: SocketAddr = listener.local_addr().expect("mock cs addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock cs serve");
+        });
+        (format!("http://{addr}"), token_hits)
+    }
+
+    #[tokio::test]
+    async fn crowdstrike_token_is_cached_across_requests_for_same_credential() {
+        // Two actions for the SAME tenant credential, each through a fresh
+        // CrowdstrikeClient (built per dispatch). The first fetches a token, the
+        // second must reuse it from the shared cache: exactly one token fetch
+        // for two actions. This is the PRX-07 fix; before it, every action paid
+        // a full OAuth round-trip.
+        let (base_url, token_hits) = spawn_counting_mock_crowdstrike().await;
+        let fallback = EdrClient::Noop;
+        // Unique client_id so this test's cache entry never collides with
+        // another test's (the cache is process-global).
+        let client_id = format!("tenant-cache-{}", std::process::id());
+        let creds = EdrCredentials {
+            provider: EdrProvider::Crowdstrike,
+            api_key: client_id,
+            api_secret: Some("secret-1".to_string()),
+            base_url: Some(base_url),
+        };
+
+        for dir in [ActionDirection::Apply, ActionDirection::Reverse] {
+            dispatch(
+                &fallback,
+                Some(&creds),
+                ActionType::HostIsolation,
+                dir,
+                "device-1",
+            )
+            .await
+            .expect("dispatch should succeed against the mock");
+        }
+
+        assert_eq!(
+            token_hits.load(Ordering::SeqCst),
+            1,
+            "the second action must reuse the cached bearer: exactly one OAuth fetch for two \
+             actions (PRX-07)"
+        );
+    }
+
+    #[tokio::test]
+    async fn crowdstrike_token_cache_does_not_leak_across_distinct_credentials() {
+        // Two DIFFERENT credentials (distinct secret -> distinct cache key) must
+        // each fetch their own token: a tenant never serves another tenant a
+        // bearer from the shared cache.
+        let (base_url, token_hits) = spawn_counting_mock_crowdstrike().await;
+        let fallback = EdrClient::Noop;
+        let id = format!("tenant-isolate-{}", std::process::id());
+
+        let creds_a = EdrCredentials {
+            provider: EdrProvider::Crowdstrike,
+            api_key: id.clone(),
+            api_secret: Some("secret-A".to_string()),
+            base_url: Some(base_url.clone()),
+        };
+        let creds_b = EdrCredentials {
+            provider: EdrProvider::Crowdstrike,
+            api_key: id,
+            api_secret: Some("secret-B".to_string()),
+            base_url: Some(base_url),
+        };
+
+        dispatch(
+            &fallback,
+            Some(&creds_a),
+            ActionType::HostIsolation,
+            ActionDirection::Apply,
+            "device-1",
+        )
+        .await
+        .expect("creds A dispatch");
+        dispatch(
+            &fallback,
+            Some(&creds_b),
+            ActionType::HostIsolation,
+            ActionDirection::Apply,
+            "device-1",
+        )
+        .await
+        .expect("creds B dispatch");
+
+        assert_eq!(
+            token_hits.load(Ordering::SeqCst),
+            2,
+            "distinct credentials must each fetch their own token; no cross-credential reuse"
+        );
+    }
+
+    #[test]
+    fn token_cache_key_is_stable_and_secret_sensitive() {
+        // Same identity -> same key (so the cache hits). Different secret ->
+        // different key (so a rotated secret never reuses a stale token). The
+        // plaintext secret must NOT appear in the key.
+        let k1 = token_cache_key("https://api.example", "id-1", "secret-xyz");
+        let k2 = token_cache_key("https://api.example", "id-1", "secret-xyz");
+        let k3 = token_cache_key("https://api.example", "id-1", "rotated-secret");
+        assert_eq!(k1, k2, "same credential identity must produce a stable key");
+        assert_ne!(k1, k3, "a rotated secret must produce a different key");
+        assert!(
+            !k1.contains("secret-xyz"),
+            "the plaintext secret must never appear in the cache key"
         );
     }
 }

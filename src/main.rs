@@ -74,6 +74,26 @@ mod nonce;
 /// timestamps caused by client clock skew or deliberate manipulation.
 const REPLAY_WINDOW_SECONDS: i64 = 30;
 
+/// Total number of `/rollback` dispatch attempts before we give up and emit the
+/// terminal `ROLLBACK_FAILED` state (RB-01 / T64). One initial try plus
+/// `ROLLBACK_MAX_ATTEMPTS - 1` retries. Small on purpose: contain/lift are
+/// idempotent, so a couple of quick retries absorb a transient EDR 5xx or a
+/// brief network blip without turning the request handler into a long-running
+/// pager. A persistent failure still surfaces promptly to the human pager.
+const ROLLBACK_MAX_ATTEMPTS: u32 = 3;
+
+/// Base backoff between `/rollback` retry attempts. The delay grows linearly
+/// with the attempt number (attempt 1 waits one base, attempt 2 waits two), a
+/// gentle backoff that stays well inside a normal request timeout. Kept short
+/// because a human approved this rollback and is waiting on the result.
+const ROLLBACK_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Minimum acceptable length (bytes) of the proxy signing secret (PRX-08).
+/// 32 bytes = 256 bits, matching the HMAC-SHA256 output width. A shorter secret
+/// weakens the one check that authorizes a real EDR action, so it fails closed
+/// in production.
+const MIN_SECRET_LEN: usize = 32;
+
 /// Default per-tenant request budget per one-second window. One tenant's
 /// containment burst can consume at most this many slots per second; once it
 /// is exhausted, only THAT tenant gets 429s. Every other tenant's
@@ -349,6 +369,40 @@ struct ExecuteResponse {
     simulated: bool,
 }
 
+/// Distinct status string the `/rollback` path returns when every internal
+/// retry is exhausted and the lift may not have taken effect. The Python pager
+/// keys on this exact string (and the `502` status) to page a human for manual
+/// reconciliation, distinct from a transient blip that the bounded retry
+/// already recovered from (RB-01 / T64).
+const ROLLBACK_FAILED_STATUS: &str = "rollback_failed";
+
+/// Distinct status string the `/execute` and `/rollback` paths return when an
+/// EDR transport failure is AMBIGUOUS about whether the action ran (timeout
+/// after send, lost response). The nonce is deliberately NOT released, so a
+/// blind retry cannot double-execute; the Python side keys on this to surface a
+/// human-reconciliation task instead of an auto-retry (CNT-05 / T63).
+const NEEDS_RECONCILIATION_STATUS: &str = "needs_reconciliation";
+
+/// Body for the error responses (`/execute` ambiguous, `/rollback` terminal
+/// failure). Distinct from `ExecuteResponse` so the Python caller can pattern
+/// match on `status` without it ever being confused with a success body. The
+/// `may_have_executed` flag is the load-bearing field: true means the EDR may
+/// already have acted and the nonce was held back to block a double-execute.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ActionFailureResponse {
+    /// One of `ROLLBACK_FAILED_STATUS` or `NEEDS_RECONCILIATION_STATUS`.
+    status: String,
+
+    /// True when the action MAY have executed (ambiguous transport failure or
+    /// a rollback whose final attempt was ambiguous). When true the nonce was
+    /// NOT released, so a naive retry will be deduped rather than re-run.
+    may_have_executed: bool,
+
+    /// Honesty label echoed from the request (demo/mock fleet), same meaning
+    /// as on `ExecuteResponse`.
+    simulated: bool,
+}
+
 /// Query parameters for the audit export endpoint.
 #[derive(Debug, Deserialize)]
 struct ExportQuery {
@@ -386,11 +440,7 @@ async fn health() -> Json<serde_json::Value> {
 ///
 /// Thin wrapper over `run_action` with `ActionDirection::Apply`. See
 /// `run_action` for the full step-numbered lifecycle.
-async fn execute(
-    state: State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Json<ExecuteResponse>, StatusCode> {
+async fn execute(state: State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     run_action(state, headers, body, actions::ActionDirection::Apply).await
 }
 
@@ -402,11 +452,7 @@ async fn execute(
 /// difference is `ActionDirection::Reverse`, which makes the EDR client call
 /// the inverse vendor action, and the audit `action_type` is prefixed
 /// `ROLLBACK_` so the trail names what was undone.
-async fn rollback(
-    state: State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Json<ExecuteResponse>, StatusCode> {
+async fn rollback(state: State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     run_action(state, headers, body, actions::ActionDirection::Reverse).await
 }
 
@@ -434,7 +480,7 @@ async fn run_action(
     headers: HeaderMap,
     body: Bytes,
     direction: actions::ActionDirection,
-) -> Result<Json<ExecuteResponse>, StatusCode> {
+) -> Response {
     // ─ Step 1: Verify HMAC on the RAW bytes we received. ──────────────
     //
     // Critical correctness point: we verify against `body` (the exact
@@ -443,14 +489,16 @@ async fn run_action(
     // signatures, and historically did - that bug masked the real
     // verification because differing serialization made every signature
     // mismatch indistinguishable from an invalid signature.
-    let signature = headers
+    let Some(signature) = headers
         .get("X-Vyrox-Signature")
         .and_then(|v| v.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
 
     if let Err(err) = hmac::verify_signature(state.hmac_secret.as_bytes(), &body, signature) {
         warn!(error = %err, "signature verification failed");
-        return Err(StatusCode::UNAUTHORIZED);
+        return StatusCode::UNAUTHORIZED.into_response();
     }
 
     // ─ Step 2: Parse JSON. ────────────────────────────────────────────
@@ -458,11 +506,12 @@ async fn run_action(
     // Only after the HMAC passes do we trust the body enough to parse
     // it. Parsing before verification would expose any serde panic /
     // pathological input to unauthenticated callers.
-    let payload: ExecuteRequest =
-        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let Ok(payload) = serde_json::from_slice::<ExecuteRequest>(&body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
 
     if payload.request_id.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return StatusCode::BAD_REQUEST.into_response();
     }
 
     // ─ Step 2b: Per-tenant rate limit. ────────────────────────────────
@@ -477,11 +526,13 @@ async fn run_action(
             tenant_id = %payload.tenant_id,
             "per-tenant rate limit exceeded"
         );
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
 
     // ─ Step 3: Replay window. ─────────────────────────────────────────
-    check_replay_window(payload.approved_at)?;
+    if let Err(status) = check_replay_window(payload.approved_at) {
+        return status.into_response();
+    }
 
     // ─ Step 4: Nonce dedup. ───────────────────────────────────────────
     //
@@ -490,30 +541,31 @@ async fn run_action(
     // result and the EDR is NOT called again. A nonce-store transport
     // error (Redis down) fails CLOSED with a 503: skipping dedup could
     // double-execute a containment, so we refuse rather than guess.
-    let claim = state
-        .nonces
-        .claim_or_replay(&payload.request_id)
-        .await
-        .map_err(|err| {
+    let claim = match state.nonces.claim_or_replay(&payload.request_id).await {
+        Ok(claim) => claim,
+        Err(err) => {
             warn!(error = %err, "nonce store unavailable; failing closed");
-            StatusCode::SERVICE_UNAVAILABLE
-        })?;
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
     match claim {
         nonce::Outcome::FreshClaim => { /* fall through to execution */ }
         nonce::Outcome::AlreadyExecuted {
             cached_response_json,
         } => {
             info!(request_id = %payload.request_id, "replaying cached response");
-            let cached: ExecuteResponse = serde_json::from_str(&cached_response_json)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            return Ok(Json(ExecuteResponse {
+            let Ok(cached) = serde_json::from_str::<ExecuteResponse>(&cached_response_json) else {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            };
+            return Json(ExecuteResponse {
                 status: "replayed".to_string(),
                 simulated: cached.simulated,
-            }));
+            })
+            .into_response();
         }
         nonce::Outcome::InFlight => {
             warn!(request_id = %payload.request_id, "duplicate while in-flight");
-            return Err(StatusCode::CONFLICT);
+            return StatusCode::CONFLICT.into_response();
         }
     }
 
@@ -540,7 +592,7 @@ async fn run_action(
         // the underlying issue (disk full, perm error) is fixed.
         warn!(error = %err, "audit write failed; releasing nonce claim");
         release_nonce(&state.nonces, &payload.request_id).await;
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     // ─ Step 6: Execute. ───────────────────────────────────────────────
@@ -557,81 +609,44 @@ async fn run_action(
     // cannot faithfully perform (e.g. PROCESS_KILL on CrowdStrike) must fail
     // loudly with a 501 before any network call, never be silently substituted.
     // The check is pure (action-name mappers only, no client, no network).
+    //
+    // contain/lift are idempotent, so the Reverse (/rollback) direction wraps
+    // the dispatch in a small bounded retry (RB-01 / T64): a transient EDR 5xx
+    // or a brief blip is absorbed in-proxy rather than immediately paging a
+    // human. /execute keeps a single attempt; a failed isolate is retried at the
+    // approval layer, and silently re-isolating is not something we want this
+    // handler doing on its own.
     let success_status = match direction {
         actions::ActionDirection::Apply => "executed",
         actions::ActionDirection::Reverse => "rolled_back",
     };
-    let supported = edr::check_supported(
+
+    // Pure supportability pre-flight: reject an action the provider cannot
+    // faithfully perform BEFORE any network call (and before the retry loop), so
+    // an unsupported action is one 501 with zero EDR calls, never retried and
+    // never silently substituted. `dispatch` re-checks internally, this keeps
+    // the decision explicit at the handler and out of the retry path.
+    if let Err(err) = edr::check_supported(
         &state.edr,
         payload.edr_credentials.as_ref(),
         payload.action_type,
         direction,
-    );
-    let outcome: Result<ExecuteResponse, edr::EdrError> = match supported {
-        Err(err) => Err(err),
-        Ok(()) => {
-            // Real dispatch. The per-tenant credentials on the request take
-            // precedence over the global env fallback (E7). The EDR client
-            // owns its own retries, timeouts, and error mapping. We echo the
-            // request's `simulated` honesty label back unchanged.
-            edr::dispatch(
-                &state.edr,
-                payload.edr_credentials.as_ref(),
-                payload.action_type,
-                direction,
-                &payload.host,
-            )
-            .await
-            .map(|()| ExecuteResponse {
-                status: success_status.to_string(),
-                simulated: payload.simulated,
-            })
-        }
-    };
-    let response = match outcome {
-        Ok(response) => response,
-        // An action the provider cannot faithfully perform is 501 Not
-        // Implemented (never silently substituted with a different action),
-        // in dry-run and live alike; every other failure is 502 Bad
-        // Gateway. Either way we append a failure audit entry so the trail
-        // records that the intent did NOT happen, then release the nonce so
-        // a retry runs on fresh state.
+    ) {
+        return handle_dispatch_failure(&state, &payload, direction, &audit_action, err).await;
+    }
+
+    let dispatch_result = dispatch_with_retry(&state, &payload, direction).await;
+
+    match dispatch_result {
+        Ok(()) => { /* fall through to success caching + 200 */ }
         Err(err) => {
-            let status = match err {
-                edr::EdrError::Unsupported { .. } => StatusCode::NOT_IMPLEMENTED,
-                _ => StatusCode::BAD_GATEWAY,
-            };
-            warn!(
-                request_id = %payload.request_id,
-                ?direction,
-                error = %err,
-                status = status.as_u16(),
-                "EDR action failed; auditing failure and releasing nonce claim"
-            );
-            // The step-5 entry recorded the INTENT. Without this
-            // companion entry the trail would read as if the action
-            // happened. Best-effort: the failure status is returned
-            // regardless, and a write error is logged, not swallowed
-            // into a fake success.
-            let failure_entry = audit::build_entry(
-                payload.tenant_id.clone(),
-                format!("FAILED_{audit_action}"),
-                payload.host.clone(),
-                payload.approved_by.clone(),
-                payload.simulated,
-            );
-            if let Err(audit_err) =
-                audit::append_audit(&state.audit_log_path, &state.audit_chain, failure_entry).await
-            {
-                warn!(
-                    request_id = %payload.request_id,
-                    error = %audit_err,
-                    "failed to write failure audit entry"
-                );
-            }
-            release_nonce(&state.nonces, &payload.request_id).await;
-            return Err(status);
+            return handle_dispatch_failure(&state, &payload, direction, &audit_action, err).await;
         }
+    }
+
+    let response = ExecuteResponse {
+        status: success_status.to_string(),
+        simulated: payload.simulated,
     };
 
     // ─ Step 7: Cache the response for future retries. ────────────────
@@ -643,8 +658,9 @@ async fn run_action(
     // idempotent EDR action, which the replay window and EDR idempotency both
     // bound, and which is strictly safer than reporting a failure for an action
     // that succeeded.
-    let cache_payload =
-        serde_json::to_string(&response).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let Ok(cache_payload) = serde_json::to_string(&response) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
     if let Err(err) = state
         .nonces
         .record_response(&payload.request_id, cache_payload)
@@ -657,7 +673,241 @@ async fn run_action(
         );
     }
 
-    Ok(Json(response))
+    Json(response).into_response()
+}
+
+/// Dispatch the action to the EDR, retrying transient failures for the
+/// idempotent `/rollback` (Reverse) direction (RB-01 / T64).
+///
+/// `/execute` (Apply) dispatches exactly once: re-isolating a host on a blip is
+/// the approval layer's call, not this handler's. `/rollback` (Reverse) retries
+/// up to `ROLLBACK_MAX_ATTEMPTS` times because contain/lift are idempotent and a
+/// transient EDR 5xx or a momentary blip should not page a human when one more
+/// quick attempt would succeed.
+///
+/// What is retried: only genuinely transient, retry-safe failures, a server
+/// 5xx, or an ambiguous transport error where the lift may not have landed.
+/// What is NOT retried: a pre-send failure (returned immediately so the nonce
+/// can be released and the request retried cleanly from scratch), a 4xx client
+/// error (a bad request will not get better by repeating it), and `Unsupported`
+/// / `Misconfigured` (decided before any call). The supportability check that
+/// rejects unsupported actions is pure and runs inside `dispatch`, so an
+/// unsupported action still fails on the first attempt with zero calls.
+async fn dispatch_with_retry(
+    state: &AppState,
+    payload: &ExecuteRequest,
+    direction: actions::ActionDirection,
+) -> Result<(), edr::EdrError> {
+    let max_attempts = match direction {
+        actions::ActionDirection::Apply => 1,
+        actions::ActionDirection::Reverse => ROLLBACK_MAX_ATTEMPTS,
+    };
+
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let result = edr::dispatch(
+            &state.edr,
+            payload.edr_credentials.as_ref(),
+            payload.action_type,
+            direction,
+            &payload.host,
+        )
+        .await;
+
+        let err = match result {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+
+        // Stop early when another attempt cannot help: we are out of attempts,
+        // the failure is not retry-safe (4xx, pre-send, unsupported,
+        // misconfigured), or this is the Apply direction (max_attempts == 1).
+        if attempt >= max_attempts || !is_retryable(&err) {
+            return Err(err);
+        }
+
+        warn!(
+            request_id = %payload.request_id,
+            ?direction,
+            attempt,
+            max_attempts,
+            error = %err,
+            "rollback dispatch failed transiently; retrying after backoff"
+        );
+        // Linear backoff: attempt 1 waits one base, attempt 2 waits two. Short
+        // by design, a human approved this rollback and is waiting on it.
+        tokio::time::sleep(ROLLBACK_RETRY_BACKOFF * attempt).await;
+    }
+}
+
+/// Whether a dispatch error is worth another attempt for an idempotent action.
+///
+/// Only a server 5xx and an ambiguous transport error qualify: both can be a
+/// momentary condition that a quick retry of an idempotent contain/lift clears.
+/// A 4xx will not improve on repeat, and a pre-send / unsupported /
+/// misconfigured error is handled by releasing the nonce (pre-send) or failing
+/// loudly, never by retrying.
+fn is_retryable(err: &edr::EdrError) -> bool {
+    matches!(
+        err,
+        edr::EdrError::ServerError { .. } | edr::EdrError::Transport(_)
+    )
+}
+
+/// Build the failure response (and companion audit entries) after a dispatch
+/// failed, honoring the exactly-once and rollback-terminal-state contracts.
+///
+/// Three distinct outcomes, by error class and direction:
+///
+/// 1. **Unsupported** (`/execute` or `/rollback`): 501 Not Implemented. The
+///    action has no faithful provider mapping; never substituted. The nonce is
+///    released, a `FAILED_` entry records the intent did not happen.
+/// 2. **Pre-send transport failure** (connection refused, DNS): the action
+///    provably did NOT run, so we release the nonce so a retry runs cleanly on
+///    fresh state, write a `FAILED_` entry, and return 502.
+/// 3. **Ambiguous transport failure** (timeout after send, lost response): the
+///    action MAY have run. We do NOT release the nonce, a blind retry would risk
+///    a double-execute. We write a distinct `NEEDS_RECONCILIATION_` audit entry
+///    making clear the action may have executed, and return a body the Python
+///    pager keys on (`needs_reconciliation`, `may_have_executed: true`).
+/// 4. **Rollback that exhausted its retries** (`/rollback` only, server 5xx or
+///    ambiguous after `ROLLBACK_MAX_ATTEMPTS`): a distinct terminal
+///    `ROLLBACK_FAILED` audit entry + `rollback_failed` response body the pager
+///    keys on. The nonce is released for a 5xx (the lift did not land, a fresh
+///    retry is safe) and held for an ambiguous final attempt (it may have).
+///
+/// Audit-before-act ordering is preserved: the intent entry was already written
+/// in step 5, and every companion entry here is written BEFORE this returns.
+async fn handle_dispatch_failure(
+    state: &AppState,
+    payload: &ExecuteRequest,
+    direction: actions::ActionDirection,
+    audit_action: &str,
+    err: edr::EdrError,
+) -> Response {
+    let is_rollback = matches!(direction, actions::ActionDirection::Reverse);
+
+    // An action with no faithful provider mapping is 501 and is never retried or
+    // reconciled: nothing ran, release the nonce and audit the non-event.
+    if matches!(err, edr::EdrError::Unsupported { .. }) {
+        warn!(
+            request_id = %payload.request_id,
+            ?direction,
+            error = %err,
+            "EDR action unsupported; auditing non-event and releasing nonce"
+        );
+        write_failure_entry(state, payload, &format!("FAILED_{audit_action}")).await;
+        release_nonce(&state.nonces, &payload.request_id).await;
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
+
+    // Did the side effect provably NOT happen? Drives both the nonce-release
+    // decision (release only when safe) and the audit/response wording.
+    let safe_to_release = err.side_effect_definitely_did_not_happen();
+
+    // The terminal label distinguishes a rollback that exhausted its retries
+    // (the pager treats it as needing human attention) from a one-shot execute
+    // failure, and an ambiguous "may have executed" from a clean non-event.
+    let (audit_label, response): (String, Response) = if is_rollback {
+        // /rollback exhausted ROLLBACK_MAX_ATTEMPTS (or hit a non-retryable
+        // error). Emit the distinct terminal ROLLBACK_FAILED state the Python
+        // pager keys on, rather than a generic 502 it has to infer from.
+        warn!(
+            request_id = %payload.request_id,
+            error = %err,
+            safe_to_release,
+            "rollback failed after internal retries; emitting terminal ROLLBACK_FAILED"
+        );
+        let body = ActionFailureResponse {
+            status: ROLLBACK_FAILED_STATUS.to_string(),
+            may_have_executed: !safe_to_release,
+            simulated: payload.simulated,
+        };
+        (
+            format!("ROLLBACK_FAILED_{audit_action}"),
+            (StatusCode::BAD_GATEWAY, Json(body)).into_response(),
+        )
+    } else if safe_to_release {
+        // /execute, pre-send: the isolate provably did not run. A FAILED_ entry
+        // records the non-event; the nonce is released below so a clean retry
+        // can run on fresh state. Plain 502.
+        warn!(
+            request_id = %payload.request_id,
+            error = %err,
+            "EDR execute failed pre-send; auditing non-event and releasing nonce"
+        );
+        (
+            format!("FAILED_{audit_action}"),
+            StatusCode::BAD_GATEWAY.into_response(),
+        )
+    } else {
+        // /execute, ambiguous: the isolate MAY have run. Hold the nonce so a
+        // blind retry cannot double-execute, and surface a distinct
+        // needs-reconciliation state with may_have_executed:true.
+        warn!(
+            request_id = %payload.request_id,
+            error = %err,
+            "EDR execute transport failure is ambiguous; holding nonce and flagging for \
+             human reconciliation (the action MAY have executed)"
+        );
+        let body = ActionFailureResponse {
+            status: NEEDS_RECONCILIATION_STATUS.to_string(),
+            may_have_executed: true,
+            simulated: payload.simulated,
+        };
+        (
+            format!("NEEDS_RECONCILIATION_{audit_action}"),
+            (StatusCode::BAD_GATEWAY, Json(body)).into_response(),
+        )
+    };
+
+    // Audit the outcome BEFORE returning. The step-5 entry recorded the intent;
+    // without this companion the trail would read as if the action happened (or
+    // as if it cleanly failed when it may not have).
+    write_failure_entry(state, payload, &audit_label).await;
+
+    // Release the nonce ONLY when the side effect provably did not happen. This
+    // is the exactly-once invariant: an ambiguous failure keeps the claim so the
+    // next retry is deduped (replayed/InFlight), never re-executed. nonce.rs
+    // warns to release only when sure the side effect did not happen.
+    if safe_to_release {
+        release_nonce(&state.nonces, &payload.request_id).await;
+    } else {
+        warn!(
+            request_id = %payload.request_id,
+            "NOT releasing nonce: the EDR action may have executed; a retry must be deduped, \
+             not re-run, until a human reconciles"
+        );
+    }
+
+    response
+}
+
+/// Append a companion failure/outcome audit entry (best-effort).
+///
+/// The action-type label (`FAILED_...`, `ROLLBACK_FAILED_...`,
+/// `NEEDS_RECONCILIATION_...`) names what happened so the trail never reads as a
+/// clean success. A write error is logged, not swallowed into a fake success and
+/// not propagated, the caller is already returning a failure status.
+async fn write_failure_entry(state: &AppState, payload: &ExecuteRequest, audit_label: &str) {
+    let entry = audit::build_entry(
+        payload.tenant_id.clone(),
+        audit_label.to_string(),
+        payload.host.clone(),
+        payload.approved_by.clone(),
+        payload.simulated,
+    );
+    if let Err(audit_err) =
+        audit::append_audit(&state.audit_log_path, &state.audit_chain, entry).await
+    {
+        warn!(
+            request_id = %payload.request_id,
+            error = %audit_err,
+            audit_label,
+            "failed to write failure audit entry"
+        );
+    }
 }
 
 /// `GET /audit/export?tenant_id=<id>`
@@ -846,6 +1096,27 @@ fn resolve_proxy_secret(is_production: bool) -> String {
     );
 }
 
+/// Decide whether a signing secret is too weak to serve production traffic
+/// (PRX-08).
+///
+/// Returns `Some(message)` when the boot must fail closed: a secret shorter than
+/// `MIN_SECRET_LEN` (256 bits) in production. Returns `None` otherwise, including
+/// for a short secret in dev/CI (the caller warns instead). Extracted as a pure
+/// function so the fail-closed rule is unit-testable without booting the async
+/// runtime, mirroring `resolve_proxy_secret`.
+fn secret_strength_error(secret: &str, is_production: bool) -> Option<String> {
+    if is_production && secret.len() < MIN_SECRET_LEN {
+        return Some(format!(
+            "proxy signing secret is only {} bytes; refusing to start in production with a \
+             signing secret shorter than {MIN_SECRET_LEN} bytes (256 bits), which weakens the \
+             HMAC that authorizes every EDR action. Set a >= {MIN_SECRET_LEN}-byte \
+             VYROX_PROXY_SECRET (PRX-08).",
+            secret.len()
+        ));
+    }
+    None
+}
+
 /// Decide whether this is a production boot.
 ///
 /// The proxy has no first-class environment field, so it reads the same
@@ -989,8 +1260,21 @@ async fn run() {
     // disable auth. (Per-tenant HKDF key derivation is deferred to keep this
     // wave in lockstep with the Python side.)
     let hmac_secret = resolve_proxy_secret(is_production);
-    if hmac_secret.len() < 32 {
-        warn!("proxy signing secret is shorter than 32 bytes; consider rotating to a longer key");
+    // PRX-08: fail closed on a weak signing secret in production (see
+    // `secret_strength_error`). The check is extracted so it is unit-testable
+    // without booting the runtime; here we turn its verdict into a panic (prod)
+    // or a warning (dev/CI).
+    match secret_strength_error(&hmac_secret, is_production) {
+        Some(message) => panic!("{message}"),
+        None if hmac_secret.len() < MIN_SECRET_LEN => {
+            warn!(
+                secret_len = hmac_secret.len(),
+                min_len = MIN_SECRET_LEN,
+                "proxy signing secret is shorter than the minimum; this fails closed in \
+                 production. Rotate to a longer key (PRX-08)."
+            );
+        }
+        None => {}
     }
 
     let audit_log_path = env::var("AUDIT_LOG_PATH").unwrap_or_else(|_| "./audit.jsonl".to_string());
@@ -1935,11 +2219,30 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_against_failing_edr_is_bad_gateway() {
-        // A mock EDR that always 500s on the action endpoint. The proxy must
-        // surface that as 502 BAD_GATEWAY (the Python side maps that to a
-        // paged ROLLBACK_FAILED), never a silent success.
-        let state: MockEdrState = Arc::new(StdMutex::new(HashMap::new()));
+        // A mock EDR that always 500s on the action endpoint. After the bounded
+        // internal retries (RB-01 / T64) the proxy must surface that as 502
+        // BAD_GATEWAY with the distinct terminal ROLLBACK_FAILED body the Python
+        // pager keys on, never a silent success.
+        let (router, _dir) = always_500_crowdstrike_router("rb-fail").await;
+        let creds = json!({
+            "provider": "crowdstrike",
+            "api_key": "id",
+            "api_secret": "secret",
+            "base_url": router.1,
+        });
+        let body = action_body("e2e-rb-fail", Some(creds));
+        let (status, value) = post_json(&router.0, "/rollback", body).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            value["status"], ROLLBACK_FAILED_STATUS,
+            "a rollback that exhausts its retries must report the terminal ROLLBACK_FAILED state"
+        );
+    }
 
+    /// Build a router plus a CrowdStrike-shaped mock whose token endpoint works
+    /// but whose device-action endpoint ALWAYS 500s, for the RB-01 terminal-state
+    /// tests. Returns (router, base_url) and a tempdir kept alive by the caller.
+    async fn always_500_crowdstrike_router(_tag: &str) -> ((Router, String), TempDir) {
         async fn token() -> Json<serde_json::Value> {
             Json(json!({"access_token": "t", "expires_in": 1800}))
         }
@@ -1952,7 +2255,127 @@ mod tests {
                 "/devices/entities/devices-actions/v2",
                 axum::routing::post(always_500),
             )
-            .with_state(state);
+            .with_state(());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr: SocketAddr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let (router, dir) = test_router(edr::EdrClient::Noop);
+        ((router, format!("http://{addr}")), dir)
+    }
+
+    // ── T63 / CNT-05: pre-send vs ambiguous transport failure ──────────────
+
+    #[tokio::test]
+    async fn execute_presend_failure_releases_nonce_for_clean_retry() {
+        // A connection refused on /execute is a PRE-SEND failure: the isolate
+        // provably did not run, so the nonce is released and a retry with the
+        // SAME request_id re-dispatches (502 again) rather than being deduped to
+        // 409. If the nonce had been wrongly held, the retry would be 409.
+        let (router, dir) = test_router(edr::EdrClient::Noop);
+        let creds = json!({
+            "provider": "crowdstrike",
+            "api_key": "id",
+            "api_secret": "secret",
+            "base_url": "http://127.0.0.1:1", // nothing listening -> connect refused
+        });
+        let body = action_body("presend-1", Some(creds.clone()));
+        let (s1, _) = post_json(&router, "/execute", body).await;
+        assert_eq!(s1, StatusCode::BAD_GATEWAY, "pre-send failure is 502");
+
+        // Same request_id again: a released nonce means a FRESH claim and another
+        // real attempt (502), NOT a 409 in-flight.
+        let body2 = action_body("presend-1", Some(creds));
+        let (s2, _) = post_json(&router, "/execute", body2).await;
+        assert_eq!(
+            s2,
+            StatusCode::BAD_GATEWAY,
+            "a pre-send failure must release the nonce so the retry re-dispatches, not 409"
+        );
+
+        // The trail records the non-event as FAILED_, never NEEDS_RECONCILIATION_.
+        let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("audit log");
+        assert!(log.contains("\"FAILED_HostIsolation\""));
+        assert!(!log.contains("NEEDS_RECONCILIATION"));
+    }
+
+    #[tokio::test]
+    async fn execute_ambiguous_failure_holds_nonce_and_flags_reconciliation() {
+        // A 5xx from the EDR on /execute is AMBIGUOUS: the EDR was contacted and
+        // may have acted. The proxy must NOT release the nonce (a blind retry
+        // would risk a double-isolate) and must surface the distinct
+        // needs_reconciliation state with may_have_executed:true. A retry with
+        // the same request_id is then deduped to 409 (the claim is still
+        // in-flight), proving the nonce was held.
+        let ((router, base_url), dir) = always_500_crowdstrike_router("amb").await;
+        let creds = json!({
+            "provider": "crowdstrike",
+            "api_key": "id",
+            "api_secret": "secret",
+            "base_url": base_url,
+        });
+        let body = action_body("ambiguous-1", Some(creds.clone()));
+        let (s1, v1) = post_json(&router, "/execute", body).await;
+        assert_eq!(s1, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            v1["status"], NEEDS_RECONCILIATION_STATUS,
+            "an ambiguous execute failure must flag for human reconciliation"
+        );
+        assert_eq!(
+            v1["may_have_executed"], true,
+            "the response must warn the action may have executed"
+        );
+
+        // Same request_id again: the nonce was held (in-flight), so this dedups
+        // to 409 rather than re-executing.
+        let body2 = action_body("ambiguous-1", Some(creds));
+        let s2 = post(&router, "/execute", body2.clone(), Some(sign_body(&body2))).await;
+        assert_eq!(
+            s2,
+            StatusCode::CONFLICT,
+            "an ambiguous failure must HOLD the nonce: the retry is deduped, not re-run"
+        );
+
+        // The trail records the ambiguity, not a clean failure.
+        let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("audit log");
+        assert!(
+            log.contains("\"NEEDS_RECONCILIATION_HostIsolation\""),
+            "the audit entry must make clear the action may have executed"
+        );
+    }
+
+    // ── T64 / RB-01: bounded rollback retry + terminal ROLLBACK_FAILED ─────
+
+    #[tokio::test]
+    async fn rollback_retries_transient_failure_then_succeeds() {
+        // A mock that 500s on the FIRST device-action hit and 200s afterward.
+        // The bounded internal retry must absorb the transient failure and the
+        // rollback must ultimately succeed (200 rolled_back), with no human page.
+        let attempt = Arc::new(StdMutex::new(0u32));
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(json!({"access_token": "t", "expires_in": 1800}))
+        }
+        async fn flaky(
+            State(attempt): State<Arc<StdMutex<u32>>>,
+        ) -> Result<Json<serde_json::Value>, StatusCode> {
+            let mut n = attempt.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                // First attempt: transient server error.
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            } else {
+                Ok(Json(json!({ "resources": [], "errors": [] })))
+            }
+        }
+        let app = Router::new()
+            .route("/oauth2/token", axum::routing::post(token))
+            .route(
+                "/devices/entities/devices-actions/v2",
+                axum::routing::post(flaky),
+            )
+            .with_state(attempt.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr: SocketAddr = listener.local_addr().expect("addr");
         tokio::spawn(async move {
@@ -1966,9 +2389,84 @@ mod tests {
             "api_secret": "secret",
             "base_url": format!("http://{addr}"),
         });
-        let body = action_body("e2e-rb-fail", Some(creds));
-        let sig = sign_body(&body);
-        let status = post(&router, "/rollback", body, Some(sig)).await;
+        let body = action_body("rb-retry-ok", Some(creds));
+        let (status, value) = post_json(&router, "/rollback", body).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the bounded retry must recover a transient rollback failure"
+        );
+        assert_eq!(value["status"], "rolled_back");
+        assert!(
+            *attempt.lock().unwrap() >= 2,
+            "the rollback must have retried at least once"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_exhausts_retries_then_emits_terminal_rollback_failed() {
+        // A device-action that ALWAYS 500s. After ROLLBACK_MAX_ATTEMPTS the proxy
+        // emits the distinct terminal ROLLBACK_FAILED audit entry + body. A 5xx
+        // is AMBIGUOUS about whether the EDR partially applied the lift, so the
+        // nonce is HELD (may_have_executed:true) rather than released: the human
+        // pager reconciles, and a blind retry is deduped to 409 instead of
+        // risking a second uncoordinated lift.
+        let ((router, base_url), dir) = always_500_crowdstrike_router("rb-exhaust").await;
+        let creds = json!({
+            "provider": "crowdstrike",
+            "api_key": "id",
+            "api_secret": "secret",
+            "base_url": base_url,
+        });
+        let body = action_body("rb-exhaust-1", Some(creds.clone()));
+        let (status, value) = post_json(&router, "/rollback", body).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(value["status"], ROLLBACK_FAILED_STATUS);
+        assert_eq!(
+            value["may_have_executed"], true,
+            "a server 5xx is ambiguous: the EDR may have partially applied the lift"
+        );
+
+        // The terminal state is in the audit trail under a distinct label.
+        let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("audit log");
+        assert!(
+            log.contains("\"ROLLBACK_FAILED_ROLLBACK_HostIsolation\""),
+            "the trail must carry the distinct terminal ROLLBACK_FAILED label, saw: {log}"
+        );
+
+        // The ambiguous failure HELD the nonce: a retry is deduped to 409, never
+        // a second uncoordinated lift, until a human reconciles.
+        let body2 = action_body("rb-exhaust-1", Some(creds));
+        let s2 = post(&router, "/rollback", body2.clone(), Some(sign_body(&body2))).await;
+        assert_eq!(
+            s2,
+            StatusCode::CONFLICT,
+            "an ambiguous rollback failure holds the nonce: the retry is deduped, not re-run"
+        );
+    }
+
+    // ── PRX-08: weak signing secret fails closed in production ─────────────
+
+    #[test]
+    fn secret_strength_error_fails_closed_only_in_production() {
+        let short = "too-short"; // < 32 bytes
+        let long = "this-secret-is-definitely-at-least-32-bytes-long"; // >= 32
+
+        // Production + short secret -> hard error (the caller panics on this).
+        assert!(
+            secret_strength_error(short, true).is_some(),
+            "a short secret must fail closed in production"
+        );
+        // Production + long secret -> fine.
+        assert!(
+            secret_strength_error(long, true).is_none(),
+            "a >= 32-byte secret is accepted in production"
+        );
+        // Dev/CI + short secret -> no hard error (the caller only warns).
+        assert!(
+            secret_strength_error(short, false).is_none(),
+            "a short secret only warns in dev/CI, never blocks"
+        );
+        assert!(secret_strength_error(long, false).is_none());
     }
 }
